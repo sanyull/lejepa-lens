@@ -65,6 +65,14 @@ const PS = 16, D = 384;
 const TH = 48, MAXS = 16;       // motion tracking: thumbnail side, and the largest shift followed (in thumbnail pixels)
 const CHECKS = { 224: [0, 27, 52, 77, 97, 122, 150, 195], 160: [0, 13, 27, 38, 52, 64, 77, 99], 128: [0, 9, 18, 27, 36, 45, 54, 63] };
 const SIZE_MB = { gpu: 43, q8: 23 };
+// Recent camera pictures: c is the picture for display, px its pixels at the model's size (filled in
+// setup), th its thumbnail for motion tracking, t the time it arrived.
+const RS = 448, RING = 24;
+const ring = Array.from({ length: RING }, () => {
+  const c = document.createElement("canvas");
+  c.width = c.height = RS;
+  return { c, ctx: c.getContext("2d"), t: -1, px: null, th: new Float32Array(TH * TH) };
+});
 
 const state = window.demo = { mode: "colors", backend: "", ms: 0, fps: 0, frames: 0, locked: false, check: null, res: 0, note: "", threads: 0 };
 let run = null, src = null, query = null, hasMap = false, hasPrev = false, fadeT0 = 0, fadeMs = 0;
@@ -96,6 +104,7 @@ function setup(res) {
   R = state.res = res; G = R / PS; N = G * G; CHECK = CHECKS[R];
   PADM = Math.ceil(MAXS * R / TH) + 1; PW = R + 2 * PADM;
   small.width = small.height = R;
+  for (const f of ring) { f.px = new Uint8ClampedArray(R * R * 4); f.t = -1; }
   ov.width = ov.height = prev.width = prev.height = mix.width = mix.height = PW;
   od = octx.createImageData(PW, PW);
   od32 = new Uint32Array(od.data.buffer);
@@ -276,7 +285,7 @@ async function createEngine() {
 // ---------- source
 async function startCamera() {
   const stream = await navigator.mediaDevices.getUserMedia({
-    video: { facingMode: "environment", width: { ideal: 640 }, height: { ideal: 640 } }, audio: false });
+    video: { facingMode: "environment", width: { ideal: 640 }, height: { ideal: 640 }, frameRate: { ideal: 30 } }, audio: false });
   const v = $("video");
   v.srcObject = stream;
   await v.play();
@@ -299,65 +308,91 @@ function drawSource(ctx, sy, sh, dw, dh) {
 // A map describes the frame the model started from, about one inference ago. To keep it on the objects
 // while the camera moves, the page measures how far the live picture has shifted since that frame
 // (on 48x48 thumbnails) and draws the map displaced by the same amount.
-const thumb = document.createElement("canvas"); thumb.width = thumb.height = TH;
-const tctx = thumb.getContext("2d", { willReadFrequently: true });
-tctx.imageSmoothingQuality = "medium";
-const refT = new Float32Array(TH * TH), capT = new Float32Array(TH * TH);
+const HT = TH / 2;                               // side of the half-size thumbnails used for the coarse search
+const refT = new Float32Array(TH * TH), refH = new Float32Array(HT * HT), curH = new Float32Array(HT * HT);
+let refMad = 1;                                  // mean |brightness - mean| of the reference: the scale of a mismatch
 let shift = [0, 0], curShift0 = [0, 0], prevShift0 = [0, 0];   // in thumbnail pixels
-// The thumbnail is drawn straight from the camera into a CPU canvas: reading pixels back from a GPU
-// canvas would make the page wait for the GPU, which is busy running the model.
-function grabThumb(out) {                       // zero-mean brightness of the current picture
-  drawSource(tctx, 0, 1, TH, TH);
-  const d = tctx.getImageData(0, 0, TH, TH).data;
+function thumbFrom(px, out) {                    // model-size pixels -> zero-mean brightness thumbnail (box average)
   let m = 0;
-  for (let i = 0; i < TH * TH; i++) { out[i] = 0.299 * d[4 * i] + 0.587 * d[4 * i + 1] + 0.114 * d[4 * i + 2]; m += out[i]; }
+  for (let ty = 0; ty < TH; ty++) {
+    const ya = (ty * R / TH) | 0, yb = ((ty + 1) * R / TH) | 0;
+    for (let tx = 0; tx < TH; tx++) {
+      const xa = (tx * R / TH) | 0, xb = ((tx + 1) * R / TH) | 0;
+      let s = 0;
+      for (let y = ya; y < yb; y++) for (let x = xa, o = (y * R + xa) * 4; x < xb; x++, o += 4) s += 0.299 * px[o] + 0.587 * px[o + 1] + 0.114 * px[o + 2];
+      m += out[ty * TH + tx] = s / ((yb - ya) * (xb - xa));
+    }
+  }
   m /= TH * TH;
   for (let i = 0; i < TH * TH; i++) out[i] -= m;
 }
-function sad(ref, cur, dx, dy) {                // mean |cur(x + dx, y + dy) - ref(x, y)| over the overlap
-  const xa = Math.max(0, -dx), xb = Math.min(TH, TH - dx), ya = Math.max(0, -dy), yb = Math.min(TH, TH - dy);
+function halve(a, out) {                         // 2x2 average
+  for (let y = 0; y < HT; y++) for (let x = 0; x < HT; x++) {
+    const o = 2 * y * TH + 2 * x;
+    out[y * HT + x] = (a[o] + a[o + 1] + a[o + TH] + a[o + TH + 1]) / 4;
+  }
+}
+function setRef(th) {
+  refT.set(th);
+  halve(refT, refH);
+  let s = 0;
+  for (let i = 0; i < TH * TH; i++) s += Math.abs(refT[i]);
+  refMad = s / (TH * TH) + 0.5;
+}
+function sad(ref, cur, n, dx, dy) {              // mean |cur(x + dx, y + dy) - ref(x, y)| over the overlap of two n x n images
+  const xa = Math.max(0, -dx), xb = Math.min(n, n - dx), ya = Math.max(0, -dy), yb = Math.min(n, n - dy);
   let s = 0;
   for (let y = ya; y < yb; y++) {
-    const r = y * TH, c = (y + dy) * TH + dx;
+    const r = y * n, c = (y + dy) * n + dx;
     for (let x = xa; x < xb; x++) s += Math.abs(cur[c + x] - ref[r + x]);
   }
   return s / ((xb - xa) * (yb - ya));
 }
-function estimateShift(ref, cur, gx, gy, rad = 3) {   // search around the guess, then refine below one pixel
-  const cx = Math.round(gx), cy = Math.round(gy);
+// How far has `cur` moved from the reference? The whole range is searched at half size on every call
+// (so a large jump between two camera pictures is still found), with a slight preference for staying
+// near the previous answer; the result is then refined at full size and below one pixel.
+// Returns [dx, dy, mismatch]: mismatch is the remaining difference relative to the picture's contrast,
+// near 0 for a clean match and near 1 when the two pictures do not line up at all.
+function estimateShift(cur, gx, gy) {
+  halve(cur, curH);
+  const lim = MAXS / 2, pen = 0.02 * refMad;
   let best = Infinity, bx = 0, by = 0;
-  for (let dy = cy - rad; dy <= cy + rad; dy++) for (let dx = cx - rad; dx <= cx + rad; dx++) {
-    if (Math.abs(dx) > MAXS || Math.abs(dy) > MAXS) continue;
-    const s = sad(ref, cur, dx, dy);
+  for (let dy = -lim; dy <= lim; dy++) for (let dx = -lim; dx <= lim; dx++) {
+    const s = sad(refH, curH, HT, dx, dy) + pen * Math.hypot(2 * dx - gx, 2 * dy - gy);
     if (s < best) { best = s; bx = dx; by = dy; }
   }
-  if (best === Infinity) return [Math.max(-MAXS, Math.min(MAXS, gx)), Math.max(-MAXS, Math.min(MAXS, gy))];
-  const sub = (a, c) => { const den = a - 2 * best + c; return den > 1e-6 ? Math.max(-0.5, Math.min(0.5, 0.5 * (a - c) / den)) : 0; };
-  const fx = Math.abs(bx) < MAXS ? sub(sad(ref, cur, bx - 1, by), sad(ref, cur, bx + 1, by)) : 0;
-  const fy = Math.abs(by) < MAXS ? sub(sad(ref, cur, bx, by - 1), sad(ref, cur, bx, by + 1)) : 0;
-  return [bx + fx, by + fy];
+  let fb = Infinity, fx = 0, fy = 0;
+  for (let dy = 2 * by - 1; dy <= 2 * by + 1; dy++) for (let dx = 2 * bx - 1; dx <= 2 * bx + 1; dx++) {
+    if (Math.abs(dx) > MAXS || Math.abs(dy) > MAXS) continue;
+    const s = sad(refT, cur, TH, dx, dy);
+    if (s < fb) { fb = s; fx = dx; fy = dy; }
+  }
+  const sub = (a, c) => { const den = a - 2 * fb + c; return den > 1e-6 ? Math.max(-0.5, Math.min(0.5, 0.5 * (a - c) / den)) : 0; };
+  const sx = Math.abs(fx) < MAXS ? sub(sad(refT, cur, TH, fx - 1, fy), sad(refT, cur, TH, fx + 1, fy)) : 0;
+  const sy = Math.abs(fy) < MAXS ? sub(sad(refT, cur, TH, fx, fy - 1), sad(refT, cur, TH, fx, fy + 1)) : 0;
+  return [fx + sx, fy + sy, fb / refMad];
 }
-state.estimateShift = estimateShift;            // exposed for tests
+state.track = { thumbFrom, setRef, estimateShift };   // exposed for tests
 
 // ---------- delayed preview
 // A map needs about one inference to arrive. Showing the camera that much late means the map appears
 // on exactly the frame it was computed from; motion tracking then only has to cover the time until
-// the next map. Recent frames are kept in a ring, each with its thumbnail.
-const RS = 448, RING = 24;
-const ring = Array.from({ length: RING }, () => {
-  const c = document.createElement("canvas");
-  c.width = c.height = RS;
-  return { c, ctx: c.getContext("2d"), t: -1, th: new Float32Array(TH * TH) };
-});
+// the next map.
 let head = 0, delay = 0, fresh = false;
 const ema = (k, v) => { state[k] = state[k] ? 0.8 * state[k] + 0.2 * v : v; };   // smoothed timings, shown by ?debug=1
+// Each camera picture is read into memory once, and before it is drawn on a GPU canvas: once a picture
+// is in use by the GPU, reading it has to wait for the GPU, which is busy running the model.
 function pushFrame(now) {
+  const t0 = performance.now();
   if (ring[head].t >= 0) ema("camMs", now - ring[head].t);
   head = (head + 1) % RING;
   const f = ring[head];
+  drawSource(sctx, 0, 1, R, R);
+  f.px.set(sctx.getImageData(0, 0, R, R).data);
+  thumbFrom(f.px, f.th);
   drawSource(f.ctx, 0, 1, RS, RS);
-  grabThumb(f.th);
   f.t = now;
+  ema("pushMs", performance.now() - t0);
   return f;
 }
 function frameAt(t) {                           // the kept frame closest to time t
@@ -526,6 +561,7 @@ function focus(attn, px) {
 // Every animation frame stores the camera picture, then shows the one from `delay` ago with the map
 // the model last produced on top.
 let gain = 1, settled = true;                   // overlay strength, and whether it has stopped changing
+const MIS0 = 0.45, MIS1 = 0.9;                  // mismatch at which the map starts to fade, and at which it is gone
 function draw(now) {
   if (!src) return;
   if (!perVideoFrame && now - ring[head].t > 12) pushFrame(now);   // at most about 60 stored frames a second
@@ -539,9 +575,11 @@ function draw(now) {
   vctx.drawImage(f.c, vx * q, vy * q, vw * q, vh * q, 0, 0, view.width, view.height);
   if (!hasMap) return;
   // follow the camera: how far is this frame from the one the map was computed from?
-  shift = fresh ? estimateShift(refT, f.th, 0, 0, 6) : estimateShift(refT, f.th, shift[0], shift[1]);
+  const e = estimateShift(f.th, fresh ? 0 : shift[0], fresh ? 0 : shift[1]);
+  shift = [e[0], e[1]];
   if (fresh) { curShift0 = shift; fresh = false; }
-  state.shift = shift;
+  state.shift = shift; state.mismatch = e[2];
+  ema("mis", e[2]);
   const k = R / TH;
   // cross-fade from the previous map over about one inference interval, so updates do not pop
   let top = ov;
@@ -551,9 +589,10 @@ function draw(now) {
     mctx.globalCompositeOperation = "lighter"; mctx.globalAlpha = a; mctx.drawImage(ov, 0, 0);
     top = mix;
   }
-  // a map far from its frame is stale: it fades instead of sliding across the picture
-  const target = clamp01(1 - (Math.hypot(shift[0], shift[1]) - 6) / 8);
-  gain += 0.35 * (target - gain);
+  // A map that is far from its frame, or that no longer lines up with it (rotation, zoom, blur),
+  // fades out: drawn firmly in the wrong place it is worse than no map. It fades quickly and returns slowly.
+  const target = Math.min(clamp01(1 - (Math.hypot(shift[0], shift[1]) - 5) / 7), clamp01((MIS1 - e[2]) / (MIS1 - MIS0)));
+  gain += (target < gain ? 0.5 : 0.15) * (target - gain);
   settled = Math.abs(target - gain) < 0.01;
   if (settled) gain = target;
   vctx.imageSmoothingEnabled = true;
@@ -569,13 +608,18 @@ const tick = () => document.hidden
   ? new Promise(r => document.addEventListener("visibilitychange", r, { once: true }))
   : new Promise(r => setTimeout(r, 0));
 async function inferLoop() {
-  let last = 0;
+  let last = 0, lastT = -2;
   for (;;) {
-    const ts = performance.now();
-    drawSource(sctx, 0, 1, R, R);               // the model's input, straight from the camera
-    grabThumb(capT);                            // the same picture, kept as the next map's reference
-    const tc = performance.now();
-    const px = sctx.getImageData(0, 0, R, R).data, n = R * R;
+    // the model's input is the newest stored picture; wait for a new one rather than repeat the last
+    let f = ring[head];
+    for (;;) {
+      if (f.t >= 0 && f.t !== lastT) break;
+      if (f.t < 0 || performance.now() - f.t > 250) { f = pushFrame(performance.now()); break; }   // preview not running
+      await new Promise(r => setTimeout(r, 4));
+      f = ring[head];
+    }
+    lastT = f.t;
+    const ts = performance.now(), tc = f.t, px = f.px, n = R * R;
     for (let i = 0; i < n; i++) { input[i] = px[4 * i] / 255; input[n + i] = px[4 * i + 1] / 255; input[2 * n + i] = px[4 * i + 2] / 255; }
     const t0 = performance.now();
     const { feat, attn } = await run(input);
@@ -594,7 +638,7 @@ async function inferLoop() {
     padEdges();
     if (hasMap) { pctx.globalCompositeOperation = "copy"; pctx.drawImage(ov, 0, 0); hasPrev = true; }
     prevShift0 = shift;
-    refT.set(capT);
+    setRef(f.th);                               // the picture this map was computed from
     octx.putImageData(od, 0, 0);
     mapVer++;
     // the preview runs this far behind, so the map appears on the very frame it was computed from
@@ -606,7 +650,8 @@ async function inferLoop() {
     ema("preMs", t0 - ts); ema("postMs", t2 - t1);
     const n0 = v => (v || 0).toFixed(0);
     const dbg = qs.get("debug") ? ` · ${R}px · ${state.note} · threads ${state.threads} · delay ${delay.toFixed(0)}`
-      + ` · pre ${n0(state.preMs)} · post ${n0(state.postMs)} · draw ${n0(state.drawMs)} · camera every ${n0(state.camMs)} ms` : "";
+      + ` · pre ${n0(state.preMs)} · post ${n0(state.postMs)} · draw ${n0(state.drawMs)} · camera every ${n0(state.camMs)} ms`
+      + ` · read ${n0(state.pushMs)} · mismatch ${(state.mis || 0).toFixed(2)}` : "";
     setStatus(`${state.backend} · ${state.ms.toFixed(0)} ms/frame · ${state.fps.toFixed(1)} fps${dbg}`);
     await tick();
   }
