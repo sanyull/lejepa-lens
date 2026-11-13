@@ -9,24 +9,34 @@
   body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.4 system-ui, sans-serif; }
   main { max-width: 520px; margin: 0 auto; padding: 12px 16px 24px; }
   p { margin: 6px 0; color: var(--dim); }
-  canvas { width: 100%; aspect-ratio: 1; display: block; border-radius: 10px; background: #000; touch-action: none; }
+  #stage { position: relative; width: 100%; aspect-ratio: 1; }
+  canvas { width: 100%; height: 100%; display: block; border-radius: 10px; background: #000; touch-action: none; }
   .row { display: flex; gap: 8px; margin: 10px 0; align-items: center; }
   button { flex: 1; padding: 10px 6px; border: 0; border-radius: 8px; background: var(--card); color: var(--fg); font: inherit; }
   button.on { background: var(--acc); color: #111; font-weight: 600; }
+  #fs { position: absolute; top: 8px; right: 8px; width: 36px; height: 36px; padding: 8px; background: rgba(0, 0, 0, .45); color: #fff; }
+  #fs svg { display: block; width: 100%; height: 100%; }
   #status { font-size: 13px; font-variant-numeric: tabular-nums; }
   video { display: none; }
   /* landscape: the picture fits the visible height, controls sit beside it */
   @media (orientation: landscape) {
     main { max-width: none; display: flex; gap: 16px; align-items: flex-start; padding: 8px 12px; }
-    canvas { width: min(calc(100vh - 16px), 60vw); width: min(calc(100dvh - 16px), 60vw); flex: none; }
+    #stage { width: min(calc(100vh - 16px), 60vw); width: min(calc(100dvh - 16px), 60vw); flex: none; }
     #side { flex: 1; min-width: 0; }
     #modes { margin-top: 0; }
+  }
+  /* a phone held sideways: a wide picture (top and bottom of the square are cropped) */
+  @media (orientation: landscape) and (max-height: 500px) {
+    #stage { aspect-ratio: 16 / 9; width: min(72vw, calc((100vh - 16px) * 16 / 9)); width: min(72vw, calc((100dvh - 16px) * 16 / 9)); }
   }
 </style>
 </head>
 <body>
 <main>
-  <canvas id="view" width="448" height="448"></canvas>
+  <div id="stage">
+    <canvas id="view" width="448" height="448"></canvas>
+    <button id="fs" aria-label="Full screen"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2"><path d="M2 7V2h5M13 2h5v5M18 13v5h-5M7 18H2v-5"/></svg></button>
+  </div>
   <div id="side">
     <div class="row" id="modes">
       <button data-mode="colors" class="on">Colors</button>
@@ -45,8 +55,12 @@
 import * as ort from "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.31.1/dist/ort.webgpu.min.mjs";
 ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.31.1/dist/";
 
-const G = 14, D = 384, N = G * G, R = 224, S = 448, PS = 16;
 const qs = new URLSearchParams(location.search);
+// input size: 160 px (10x10 patches) on phones for speed, 224 px (14x14) elsewhere; ?res= overrides
+const mobile = navigator.userAgentData ? navigator.userAgentData.mobile : /Android|iPhone|iPad/.test(navigator.userAgent);
+const R = qs.get("res") === "224" ? 224 : qs.get("res") === "160" ? 160 : mobile ? 160 : 224;
+const PS = 16, G = R / PS, N = G * G, D = 384;
+const CHECK = R === 224 ? [0, 27, 52, 77, 97, 122, 150, 195] : [0, 13, 27, 38, 52, 64, 77, 99];
 const $ = id => document.getElementById(id);
 const view = $("view"), vctx = view.getContext("2d");
 const small = document.createElement("canvas"); small.width = small.height = R;
@@ -54,7 +68,7 @@ const sctx = small.getContext("2d", { willReadFrequently: true });
 const ov = document.createElement("canvas"); ov.width = ov.height = R;
 const octx = ov.getContext("2d"), od = octx.createImageData(R, R);
 
-const state = window.demo = { mode: "colors", backend: "", ms: 0, fps: 0, frames: 0, locked: false, check: null };
+const state = window.demo = { mode: "colors", backend: "", ms: 0, fps: 0, frames: 0, locked: false, check: null, res: R };
 let session = null, src = null, busy = false, query = null;
 const setStatus = t => { $("status").textContent = t; };
 
@@ -76,11 +90,10 @@ async function fetchBytes(url, label) {
   return out;
 }
 
-// Run a fixed synthetic pattern and compare with reference features (check.bin, made by mkcheck.py).
+// Run a fixed synthetic pattern and compare with reference features (check_<size>.bin, made by export.py).
 // Returns the mean cosine of mean-centred features over 8 patches, or null if there is no reference.
-const CHECK = [0, 27, 52, 77, 97, 122, 150, 195];
 async function fidelity(sess) {
-  const r = await fetch("check.bin");
+  const r = await fetch(`check_${R}.bin`);
   if (!r.ok) return null;
   const ref = new Float32Array(await r.arrayBuffer()), x = new Float32Array(3 * R * R), K = CHECK.length;
   for (let c = 0; c < 3; c++) for (let y = 0; y < R; y++) for (let xx = 0; xx < R; xx++)
@@ -100,24 +113,22 @@ async function fidelity(sess) {
 async function createSession() {
   if (qs.get("ep") !== "wasm" && navigator.gpu) {
     try {
-      const ad = await navigator.gpu.requestAdapter();
-      if (ad && ad.features.has("shader-f16")) {
-        const bytes = await fetchBytes("model_fp16.onnx", "model");
-        setStatus("Preparing model…");
-        const s = await ort.InferenceSession.create(bytes, { executionProviders: ["webgpu"] });
-        state.check = await fidelity(s);
-        // some GPUs compute 16-bit floats too coarsely; fall back rather than show corrupted maps
-        if (state.check === null || state.check >= 0.95) return [s, "WebGPU"];
-        console.warn("WebGPU output differs from the reference, falling back to WASM. fidelity =", state.check);
-      }
+      // weights are stored as 16-bit floats but the arithmetic is 32-bit: some phone GPUs
+      // compute 16-bit floats too coarsely and returned corrupted maps
+      const bytes = await fetchBytes(`model_${R}.onnx`, "model");
+      setStatus("Preparing model…");
+      const s = await ort.InferenceSession.create(bytes, { executionProviders: ["webgpu"] });
+      state.check = await fidelity(s);
+      if (state.check === null || state.check >= 0.95) return [s, "WebGPU"];
+      console.warn("WebGPU output differs from the reference, falling back to WASM. fidelity =", state.check);
     } catch (e) { console.warn("WebGPU unavailable, falling back to WASM", e); }
   }
-  const bytes = await fetchBytes("model_q8.onnx", "model");
+  const bytes = await fetchBytes(`model_q8_${R}.onnx`, "model");
   setStatus("Preparing model…");
   return [await ort.InferenceSession.create(bytes, { executionProviders: ["wasm"] }), "WASM"];
 }
 
-// ---------- source
+// ---------- source and layout
 async function startCamera() {
   const stream = await navigator.mediaDevices.getUserMedia({
     video: { facingMode: "environment", width: { ideal: 640 }, height: { ideal: 640 } }, audio: false });
@@ -132,9 +143,21 @@ const useImage = url => new Promise((res, rej) => {
   im.onerror = () => rej(new Error("image failed to load"));
   im.src = url;
 });
-function drawSquare(ctx, size) {
+// The model always sees a centred square. A phone held sideways shows the middle band of it (16:9).
+const wideQ = matchMedia("(orientation: landscape) and (max-height: 500px)");
+let y0 = 0, bandH = R;
+function layout() {
+  bandH = wideQ.matches ? R * 9 / 16 : R;
+  y0 = (R - bandH) / 2;
+  view.width = wideQ.matches ? 640 : 448;
+  view.height = wideQ.matches ? 360 : 448;
+}
+wideQ.addEventListener("change", layout);
+layout();
+function drawSource(ctx, sy, sh, dw, dh) {
+  // sy, sh: band of the centred square, as fractions of its side
   const w = src.videoWidth || src.naturalWidth, h = src.videoHeight || src.naturalHeight, s = Math.min(w, h);
-  ctx.drawImage(src, (w - s) / 2, (h - s) / 2, s, s, 0, 0, size, size);
+  ctx.drawImage(src, (w - s) / 2, (h - s) / 2 + s * sy, s, s * sh, 0, 0, dw, dh);
 }
 
 // ---------- maths
@@ -149,7 +172,7 @@ function heat(t, o, alpha) {
 }
 
 // Edge-aware upsampling (joint bilateral): each pixel takes the value of nearby patches whose
-// average color resembles the pixel, so the 14x14 map follows the edges of the camera image.
+// average color resembles the pixel, so the patch map follows the edges of the camera image.
 const WS = new Float32Array(PS * PS * 9), WR = new Float32Array(1024), pm = new Float32Array(N * 3);
 for (let fy = 0; fy < PS; fy++) for (let fx = 0; fx < PS; fx++) for (let dy = -1, k = 0; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++, k++) {
   const py = (fy + 0.5) / PS - 0.5 - dy, px = (fx + 0.5) / PS - 0.5 - dx;
@@ -165,7 +188,7 @@ function patchMeans(px) {
   for (let i = 0; i < N * 3; i++) pm[i] /= PS * PS;
 }
 function upsample(vals, C, px, write) {
-  for (let y = 0; y < R; y++) {
+  for (let y = Math.floor(y0), ye = Math.ceil(y0 + bandH); y < ye; y++) {   // only the rows on screen
     const cy = y >> 4, fy = y & 15;
     for (let x = 0; x < R; x++) {
       const cx = x >> 4, o = (y * R + x) * 4, r = px[o], g = px[o + 1], b = px[o + 2];
@@ -269,7 +292,7 @@ function focus(attn, px) {
 // ---------- frame
 const input = new Float32Array(3 * R * R);
 async function step() {
-  drawSquare(sctx, R);
+  drawSource(sctx, 0, 1, R, R);
   const px = sctx.getImageData(0, 0, R, R).data, n = R * R;
   for (let i = 0; i < n; i++) { input[i] = px[4 * i] / 255; input[n + i] = px[4 * i + 1] / 255; input[2 * n + i] = px[4 * i + 2] / 255; }
   const t0 = performance.now();
@@ -283,11 +306,12 @@ async function step() {
   if (state.mode === "colors") colors(feat, px);
   else if (state.mode === "touch") touch(feat, px);
   else focus(out.attn.data, px);
-  drawSquare(vctx, S);
+  drawSource(vctx, y0 / R, bandH / R, view.width, view.height);
   octx.putImageData(od, 0, 0);
   vctx.imageSmoothingEnabled = true;
-  vctx.drawImage(ov, 0, 0, S, S);
-  setStatus(`${state.backend} · ${state.ms.toFixed(0)} ms/frame · ${state.fps.toFixed(1)} fps`);
+  vctx.drawImage(ov, 0, y0, R, bandH, 0, 0, view.width, view.height);
+  const dbg = qs.get("debug") ? ` · ${R}px · check ${state.check === null ? "n/a" : state.check.toFixed(3)}` : "";
+  setStatus(`${state.backend} · ${state.ms.toFixed(0)} ms/frame · ${state.fps.toFixed(1)} fps${dbg}`);
 }
 let lastT = 0;
 async function loop(t) {
@@ -319,10 +343,17 @@ view.addEventListener("pointerdown", e => {
   if (state.mode !== "touch" || !state.feat) return;
   const r = view.getBoundingClientRect();
   const gx = Math.min(G - 1, Math.floor((e.clientX - r.left) / r.width * G));
-  const gy = Math.min(G - 1, Math.floor((e.clientY - r.top) / r.height * G));
+  const gy = Math.min(G - 1, Math.floor((y0 + (e.clientY - r.top) / r.height * bandH) / PS));
   query = Float32Array.from(state.feat.subarray((gy * G + gx) * D, (gy * G + gx + 1) * D));
   normalize(query);
 });
+// full screen hides the address bar; browsers only allow it from a tap
+if (document.documentElement.requestFullscreen) {
+  $("fs").addEventListener("click", () => {
+    if (document.fullscreenElement) document.exitFullscreen();
+    else document.documentElement.requestFullscreen({ navigationUI: "hide" }).catch(e => console.warn(e));
+  });
+} else $("fs").style.display = "none";
 
 requestAnimationFrame(loop);
 try {
