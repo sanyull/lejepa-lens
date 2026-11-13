@@ -276,10 +276,53 @@ const useImage = url => new Promise((res, rej) => {
   im.src = url;
 });
 function drawSource(ctx, sy, sh, dw, dh) {
-  // sy, sh: band of the centred square, as fractions of its side
+  // sy, sh: band of the centred square, as fractions of its side (state.pan shifts the view, for testing)
   const w = src.videoWidth || src.naturalWidth, h = src.videoHeight || src.naturalHeight, s = Math.min(w, h);
-  ctx.drawImage(src, (w - s) / 2, (h - s) / 2 + s * sy, s, s * sh, 0, 0, dw, dh);
+  ctx.drawImage(src, (w - s) / 2 + (state.pan || 0) * s, (h - s) / 2 + s * sy, s, s * sh, 0, 0, dw, dh);
 }
+
+// ---------- motion tracking
+// A map describes the frame the model started from, about one inference ago. To keep it on the objects
+// while the camera moves, the page measures how far the live picture has shifted since that frame
+// (on 48x48 thumbnails) and draws the map displaced by the same amount.
+const TH = 48, MAXS = 16;
+const thumb = document.createElement("canvas"); thumb.width = thumb.height = TH;
+const tctx = thumb.getContext("2d", { willReadFrequently: true });
+tctx.imageSmoothingQuality = "medium";
+const refT = new Float32Array(TH * TH), capT = new Float32Array(TH * TH), curT = new Float32Array(TH * TH);
+let shift = [0, 0], capShift = [0, 0], curShift0 = [0, 0], prevShift0 = [0, 0];   // in thumbnail pixels
+function grabThumb(out) {                       // zero-mean brightness of the centred square
+  drawSource(tctx, 0, 1, TH, TH);
+  const d = tctx.getImageData(0, 0, TH, TH).data;
+  let m = 0;
+  for (let i = 0; i < TH * TH; i++) { out[i] = 0.299 * d[4 * i] + 0.587 * d[4 * i + 1] + 0.114 * d[4 * i + 2]; m += out[i]; }
+  m /= TH * TH;
+  for (let i = 0; i < TH * TH; i++) out[i] -= m;
+}
+function sad(ref, cur, dx, dy) {                // mean |cur(x + dx, y + dy) - ref(x, y)| over the overlap
+  const xa = Math.max(0, -dx), xb = Math.min(TH, TH - dx), ya = Math.max(0, -dy), yb = Math.min(TH, TH - dy);
+  let s = 0;
+  for (let y = ya; y < yb; y++) {
+    const r = y * TH, c = (y + dy) * TH + dx;
+    for (let x = xa; x < xb; x++) s += Math.abs(cur[c + x] - ref[r + x]);
+  }
+  return s / ((xb - xa) * (yb - ya));
+}
+function estimateShift(ref, cur, gx, gy) {      // search +-3 around the guess, then refine below one pixel
+  const cx = Math.round(gx), cy = Math.round(gy);
+  let best = Infinity, bx = 0, by = 0;
+  for (let dy = cy - 3; dy <= cy + 3; dy++) for (let dx = cx - 3; dx <= cx + 3; dx++) {
+    if (Math.abs(dx) > MAXS || Math.abs(dy) > MAXS) continue;
+    const s = sad(ref, cur, dx, dy);
+    if (s < best) { best = s; bx = dx; by = dy; }
+  }
+  if (best === Infinity) return [Math.max(-MAXS, Math.min(MAXS, gx)), Math.max(-MAXS, Math.min(MAXS, gy))];
+  const sub = (a, c) => { const den = a - 2 * best + c; return den > 1e-6 ? Math.max(-0.5, Math.min(0.5, 0.5 * (a - c) / den)) : 0; };
+  const fx = Math.abs(bx) < MAXS ? sub(sad(ref, cur, bx - 1, by), sad(ref, cur, bx + 1, by)) : 0;
+  const fy = Math.abs(by) < MAXS ? sub(sad(ref, cur, bx, by - 1), sad(ref, cur, bx, by + 1)) : 0;
+  return [bx + fx, by + fy];
+}
+state.estimateShift = estimateShift;            // exposed for tests
 
 // ---------- maths
 const dot = (a, b) => { let s = 0; for (let j = 0; j < D; j++) s += a[j] * b[j]; return s; };
@@ -407,16 +450,22 @@ function draw() {
   if (src) {
     drawSource(vctx, y0 / R, bandH / R, view.width, view.height);
     if (hasMap) {
+      // follow the camera: how far has the picture moved since the frame this map was computed from?
+      grabThumb(curT);
+      shift = estimateShift(refT, curT, shift[0], shift[1]);
+      state.shift = shift;
+      const k = R / TH;
       // cross-fade from the previous map over about one inference interval, so updates do not pop
       const a = hasPrev && fadeMs ? Math.min(1, (performance.now() - fadeT0) / fadeMs) : 1;
       let top = ov;
       if (a < 1) {
-        mctx.globalCompositeOperation = "copy"; mctx.globalAlpha = 1 - a; mctx.drawImage(prev, 0, 0);
+        mctx.globalCompositeOperation = "copy"; mctx.globalAlpha = 1 - a;
+        mctx.drawImage(prev, (prevShift0[0] - curShift0[0]) * k, (prevShift0[1] - curShift0[1]) * k);
         mctx.globalCompositeOperation = "lighter"; mctx.globalAlpha = a; mctx.drawImage(ov, 0, 0);
         top = mix;
       }
       vctx.imageSmoothingEnabled = true;
-      vctx.drawImage(top, 0, y0, R, bandH, 0, 0, view.width, view.height);
+      vctx.drawImage(top, -shift[0] * k, y0 - shift[1] * k, R, bandH, 0, 0, view.width, view.height);
     }
   }
   requestAnimationFrame(draw);
@@ -425,6 +474,8 @@ async function inferLoop() {
   let last = 0;
   for (;;) {
     drawSource(sctx, 0, 1, R, R);
+    grabThumb(capT);                            // the same frame, kept as the next map's reference
+    capShift = shift;
     const px = sctx.getImageData(0, 0, R, R).data, n = R * R;
     for (let i = 0; i < n; i++) { input[i] = px[4 * i] / 255; input[n + i] = px[4 * i + 1] / 255; input[2 * n + i] = px[4 * i + 2] / 255; }
     const t0 = performance.now();
@@ -442,6 +493,10 @@ async function inferLoop() {
     else if (state.mode === "touch") touch(feat, px);
     else focus(attn, px);
     if (hasMap) { pctx.globalCompositeOperation = "copy"; pctx.drawImage(ov, 0, 0); hasPrev = true; }
+    // the new map belongs to the frame grabbed before the model ran; it has moved since then
+    prevShift0 = shift;
+    shift = curShift0 = hasMap ? [shift[0] - capShift[0], shift[1] - capShift[1]] : [0, 0];
+    refT.set(capT);
     octx.putImageData(od, 0, 0);
     fadeT0 = performance.now(); fadeMs = Math.min(500, gap);
     hasMap = true;
