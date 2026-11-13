@@ -54,33 +54,66 @@
 <script type="module">
 const ORT = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.31.1/dist/";
 const qs = new URLSearchParams(location.search);
-// input size: 160 px (10x10 patches) on phones for speed, 224 px (14x14) elsewhere; ?res= overrides
-const mobile = navigator.userAgentData ? navigator.userAgentData.mobile : /Android|iPhone|iPad/.test(navigator.userAgent);
-const R = qs.get("res") === "224" ? 224 : qs.get("res") === "160" ? 160 : mobile ? 160 : 224;
-const PS = 16, G = R / PS, N = G * G, D = 384;
-const CHECK = R === 224 ? [0, 27, 52, 77, 97, 122, 150, 195] : [0, 13, 27, 38, 52, 64, 77, 99];
 const $ = id => document.getElementById(id);
 const view = $("view"), vctx = view.getContext("2d");
-const small = document.createElement("canvas"); small.width = small.height = R;
-const sctx = small.getContext("2d", { willReadFrequently: true });
-const ov = document.createElement("canvas"); ov.width = ov.height = R;
-const octx = ov.getContext("2d"), od = octx.createImageData(R, R);
+const small = document.createElement("canvas"), sctx = small.getContext("2d", { willReadFrequently: true });
+const ov = document.createElement("canvas"), octx = ov.getContext("2d");
+const PS = 16, D = 384;
+const CHECKS = { 224: [0, 27, 52, 77, 97, 122, 150, 195], 160: [0, 13, 27, 38, 52, 64, 77, 99], 128: [0, 9, 18, 27, 36, 45, 54, 63] };
+const SIZE_MB = { gpu: 43, q8: 23 };
 
-const state = window.demo = { mode: "colors", backend: "", ms: 0, fps: 0, frames: 0, locked: false, check: null, res: R, note: "", threads: 0 };
+const state = window.demo = { mode: "colors", backend: "", ms: 0, fps: 0, frames: 0, locked: false, check: null, res: 0, note: "", threads: 0 };
 let run = null, src = null, query = null, hasMap = false;
 const setStatus = t => { $("status").textContent = t; };
+const saved = k => { try { return localStorage.getItem(k); } catch (e) { return null; } };
+const save = (k, v) => { try { localStorage.setItem(k, v); } catch (e) { /* storage unavailable */ } };
+
+// ---------- input size
+// R is the model's square input in pixels, G the patches per side, N the patch count. Everything sized
+// by them is (re)allocated here: the GPU and CPU paths may use different sizes.
+let R, G, N, CHECK, od, input, pm, Xc, proj, Y, T, A, TAPER, y0, bandH, pcaReady, focusReady;
+const wideQ = matchMedia("(orientation: landscape) and (max-height: 500px)");
+function layout() {
+  // the model always sees a centred square; a phone held sideways shows the middle band of it (16:9)
+  bandH = wideQ.matches ? R * 9 / 16 : R;
+  y0 = (R - bandH) / 2;
+  view.width = wideQ.matches ? 640 : 448;
+  view.height = wideQ.matches ? 360 : 448;
+}
+wideQ.addEventListener("change", layout);
+function setup(res) {
+  R = state.res = res; G = R / PS; N = G * G; CHECK = CHECKS[R];
+  small.width = small.height = ov.width = ov.height = R;
+  od = octx.createImageData(R, R);
+  input = new Float32Array(3 * R * R);
+  pm = new Float32Array(N * 3); Xc = new Float32Array(N * D); proj = new Float32Array(N);
+  Y = new Float32Array(N * 3); T = new Float32Array(N); A = new Float32Array(N);
+  // border patches attract attention whatever the scene shows, so Focus damps them
+  TAPER = Float32Array.from({ length: N }, (_, i) => {
+    const y = (i / G) | 0, x = i % G, ey = y === 0 || y === G - 1, ex = x === 0 || x === G - 1;
+    return ey && ex ? 0.25 : ey || ex ? 0.5 : 1;
+  });
+  pcaReady = focusReady = hasMap = false;
+  query = null;
+  layout();
+}
+const mobile = navigator.userAgentData ? navigator.userAgentData.mobile : /Android|iPhone|iPad/.test(navigator.userAgent);
+const forced = +qs.get("res") in CHECKS ? +qs.get("res") : 0;      // ?res=224|160|128
+const RES_GPU = forced || (mobile ? 160 : 224), RES_CPU = forced || (mobile ? 128 : 224);
+setup(RES_GPU);
 
 // ---------- model
-async function fetchBytes(url, label) {
+async function fetchBytes(url, mb) {
   const r = await fetch(url);
   if (!r.ok) throw new Error(`${url}: HTTP ${r.status}`);
-  const total = +r.headers.get("content-length") || 0, reader = r.body.getReader(), chunks = [];
+  const reader = r.body.getReader(), chunks = [];
   let got = 0;
   for (;;) {
     const { done, value } = await reader.read();
     if (done) break;
     chunks.push(value); got += value.length;
-    setStatus(`Loading ${label}: ${(got / 1e6).toFixed(0)}${total ? " / " + (total / 1e6).toFixed(0) : ""} MB`);
+    // the size is hard-coded: a compressed transfer reports its compressed length, not the file's
+    setStatus(`Loading model: ${Math.min(mb, Math.round(got / 1e6))} / ${mb} MB`);
   }
   const out = new Uint8Array(got);
   let o = 0;
@@ -125,9 +158,11 @@ function wasmEngine(bytes, threads) {
   return new Promise((res, rej) => {
     const w = new Worker("worker.js", { type: "module" });
     let pending = null;
+    const fn = x => new Promise((ok, no) => { pending = { ok, no }; w.postMessage({ type: "run", input: x, size: R }); });
+    fn.release = () => w.terminate();
     w.onmessage = e => {
       const m = e.data;
-      if (m.type === "ready") res(input => new Promise((ok, no) => { pending = { ok, no }; w.postMessage({ type: "run", input, size: R }); }));
+      if (m.type === "ready") res(fn);
       else if (m.type === "out") pending.ok(m);
       else (pending ? pending.no : rej)(new Error(m.message));
     };
@@ -135,38 +170,60 @@ function wasmEngine(bytes, threads) {
     w.postMessage({ type: "init", bytes, threads }, [bytes.buffer]);
   });
 }
+// More threads are not always faster on a phone, so the first visit times 1, 2 and 4 and keeps the best.
+const THREADS_KEY = "lens.threads.v1";
+async function tunedWasmEngine(bytes) {
+  const max = crossOriginIsolated ? Math.min(4, navigator.hardwareConcurrency || 1) : 1;
+  const cands = [1, 2, 4].filter(t => t <= max), known = +(qs.get("threads") || saved(THREADS_KEY));
+  if (cands.length === 1 || cands.includes(known)) {
+    state.threads = cands.includes(known) ? known : 1;
+    return wasmEngine(bytes, state.threads);
+  }
+  const x = new Float32Array(3 * R * R).fill(0.5);
+  let best = null;
+  for (const t of cands) {
+    setStatus(`Tuning for this device: ${t} thread${t > 1 ? "s" : ""}…`);
+    const fn = await wasmEngine(bytes.slice(), t);
+    await fn(x);                                            // warm-up
+    const t0 = performance.now();
+    await fn(x); await fn(x);
+    const ms = (performance.now() - t0) / 2;
+    if (!best || ms < best.ms * 0.9) { if (best) best.fn.release(); best = { fn, ms, t }; } else fn.release();
+  }
+  state.threads = best.t;
+  save(THREADS_KEY, String(best.t));
+  return best.fn;
+}
 // A device whose GPU failed the check is remembered, so later visits skip that download (?ep=webgpu retries).
-const GPU_KEY = "lens.gpu.v2";
-const remembered = () => { try { return localStorage.getItem(GPU_KEY); } catch (e) { return null; } };
-const remember = v => { try { localStorage.setItem(GPU_KEY, v); } catch (e) { /* storage unavailable */ } };
+const GPU_KEY = "lens.gpu.v3";
 
 async function createEngine() {
   const want = qs.get("ep");
   if (!navigator.gpu) state.note = "no gpu";
   else if (want === "wasm") state.note = "gpu skipped";
-  else if (want !== "webgpu" && remembered()) state.note = `gpu skipped, earlier: ${remembered()}`;
+  else if (want !== "webgpu" && saved(GPU_KEY)) state.note = `gpu skipped, earlier: ${saved(GPU_KEY)}`;
   else {
-    // weights are stored as 16-bit floats but the arithmetic is 32-bit
-    const bytes = await fetchBytes(`model_${R}.onnx`, "model");
+    // this model uses only basic operations and 32-bit arithmetic: phone GPUs got other versions wrong
+    const bytes = await fetchBytes(`model_gpu_${R}.onnx`, SIZE_MB.gpu);
     setStatus("Preparing model…");
     let fn = null;
     try {
       fn = await gpuEngine(bytes);
       state.check = await fidelity(fn);
-      if (state.check === null || state.check >= 0.95) { state.note = "gpu ok"; return [fn, "WebGPU"]; }
+      if (state.check === null || state.check >= 0.95) { state.note = `gpu check ${state.check === null ? "n/a" : state.check.toFixed(3)}`; return [fn, "WebGPU"]; }
       state.note = `gpu check ${state.check.toFixed(3)}`;
     } catch (e) { state.note = `gpu error: ${e.message}`; }
     console.warn("WebGPU not usable, falling back to WASM:", state.note);
     if (fn) fn.release();
-    remember(state.note);
+    save(GPU_KEY, state.note);
   }
-  state.threads = crossOriginIsolated ? Math.min(4, navigator.hardwareConcurrency || 2) : 1;
-  const bytes = await fetchBytes(qs.get("wm") === "f32" ? `model_${R}.onnx` : `model_q8_${R}.onnx`, "model");
+  setup(RES_CPU);
+  const bytes = await fetchBytes(`model_q8_${R}.onnx`, SIZE_MB.q8);
   setStatus("Preparing model…");
-  return [await wasmEngine(bytes, state.threads), "WASM"];
+  return [await tunedWasmEngine(bytes), "WASM"];
 }
 
-// ---------- source and layout
+// ---------- source
 async function startCamera() {
   const stream = await navigator.mediaDevices.getUserMedia({
     video: { facingMode: "environment", width: { ideal: 640 }, height: { ideal: 640 } }, audio: false });
@@ -181,17 +238,6 @@ const useImage = url => new Promise((res, rej) => {
   im.onerror = () => rej(new Error("image failed to load"));
   im.src = url;
 });
-// The model always sees a centred square. A phone held sideways shows the middle band of it (16:9).
-const wideQ = matchMedia("(orientation: landscape) and (max-height: 500px)");
-let y0 = 0, bandH = R;
-function layout() {
-  bandH = wideQ.matches ? R * 9 / 16 : R;
-  y0 = (R - bandH) / 2;
-  view.width = wideQ.matches ? 640 : 448;
-  view.height = wideQ.matches ? 360 : 448;
-}
-wideQ.addEventListener("change", layout);
-layout();
 function drawSource(ctx, sy, sh, dw, dh) {
   // sy, sh: band of the centred square, as fractions of its side
   const w = src.videoWidth || src.naturalWidth, h = src.videoHeight || src.naturalHeight, s = Math.min(w, h);
@@ -211,7 +257,7 @@ function heat(t, o, alpha) {
 
 // Edge-aware upsampling (joint bilateral): each pixel takes the value of nearby patches whose
 // average color resembles the pixel, so the patch map follows the edges of the camera image.
-const WS = new Float32Array(PS * PS * 9), WR = new Float32Array(1024), pm = new Float32Array(N * 3);
+const WS = new Float32Array(PS * PS * 9), WR = new Float32Array(1024);
 for (let fy = 0; fy < PS; fy++) for (let fx = 0; fx < PS; fx++) for (let dy = -1, k = 0; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++, k++) {
   const py = (fy + 0.5) / PS - 0.5 - dy, px = (fx + 0.5) / PS - 0.5 - dx;
   WS[(fy * PS + fx) * 9 + k] = Math.exp(-(py * py + px * px) / 1.125);   // sigma = 0.75 patch
@@ -248,10 +294,7 @@ function upsample(vals, C, px, write) {
 
 // PCA basis tracked by warm-started power iteration, so colors drift slowly instead of flipping
 const mu = new Float32Array(D), V = [0, 1, 2].map(() => Float32Array.from({ length: D }, () => Math.random() - 0.5));
-const lo = new Float32Array(3), hi = new Float32Array(3);
-const Xc = new Float32Array(N * D), proj = new Float32Array(N), tmp = new Float32Array(D);
-const Y = new Float32Array(N * 3), T = new Float32Array(N);
-let pcaReady = false;
+const lo = new Float32Array(3), hi = new Float32Array(3), tmp = new Float32Array(D);
 function center(feat) {
   for (let i = 0; i < N; i++) for (let j = 0; j < D; j++) Xc[i * D + j] = feat[i * D + j] - mu[j];
 }
@@ -305,14 +348,8 @@ function touch(feat, px) {
   // spotlight: similar regions stay lit, the rest is dimmed
   upsample(T, 1, px, (o, t) => { od.data[o] = od.data[o + 1] = od.data[o + 2] = 0; od.data[o + 3] = 230 * (1 - t); });
 }
-// Border patches attract attention whatever the scene shows, so they are damped. The map is then
-// scored against its own spread: a scene with nothing salient stays dark instead of amplifying noise.
-const TAPER = Float32Array.from({ length: N }, (_, i) => {
-  const y = (i / G) | 0, x = i % G, ey = y === 0 || y === G - 1, ex = x === 0 || x === G - 1;
-  return ey && ex ? 0.25 : ey || ex ? 0.5 : 1;
-});
-const A = new Float32Array(N);
-let focusReady = false;
+// The attention map is scored against its own spread: a scene with nothing salient stays dark
+// instead of amplifying noise.
 function focus(attn, px) {
   let m = 0, v = 0;
   for (let i = 0; i < N; i++) { A[i] = attn[i] * TAPER[i]; m += A[i]; }
@@ -327,7 +364,7 @@ function focus(attn, px) {
   upsample(T, 1, px, (o, t) => heat(0.25 + 0.75 * t, o, Math.sqrt(t) * 0.9));
 }
 
-// ---------- frame
+// ---------- frames
 // The camera is drawn on every animation frame; the map on top is whatever the model last produced.
 function draw() {
   if (src) {
@@ -339,7 +376,6 @@ function draw() {
   }
   requestAnimationFrame(draw);
 }
-const input = new Float32Array(3 * R * R);
 async function inferLoop() {
   let last = 0;
   for (;;) {

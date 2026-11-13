@@ -1,0 +1,35 @@
+pytorch2.13.0:Ù
+V
+x/ReduceMax_output_0
+/ReduceMax"	ReduceMax*
+axes@ÿÿÿÿÿÿÿÿÿ *
+keepdims 
+2
+x
+/ReduceMax_output_0/Sub_output_0/Sub"Sub
+)
+/Sub_output_0/Exp_output_0/Exp"Exp
+Eonnx::ReduceSum_4
+Constant_4"Constant*
+value*Jÿÿÿÿÿÿÿÿ 
+_
+/Exp_output_0
+onnx::ReduceSum_4/ReduceSum_output_0
+/ReduceSum"	ReduceSum*
+keepdims 
+2
+/Exp_output_0
+/ReduceSum_output_0y/Div"Div
+main_graphZ
+x
+
+
+
+e
+eb
+y
+
+
+
+e
+eB

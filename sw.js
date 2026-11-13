@@ -8,6 +8,8 @@ self.addEventListener("fetch", e => {
   e.respondWith(fetch(req).then(res => {
     if (res.status === 0) return res;                       // opaque response: leave untouched
     const h = new Headers(res.headers);
+    h.delete("Content-Encoding");                           // the body here is already decompressed,
+    h.delete("Content-Length");                             // so the compressed length no longer applies
     h.set("Cross-Origin-Embedder-Policy", "require-corp");
     h.set("Cross-Origin-Opener-Policy", "same-origin");
     h.set("Cross-Origin-Resource-Policy", "cross-origin");

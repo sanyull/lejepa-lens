@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LeJEPA Lens GPU check</title>
+<style>
+  body { margin: 0; padding: 12px; background: #0f1115; color: #e8e8ea; font: 12px/1.45 ui-monospace, Menlo, Consolas, monospace; }
+  pre { margin: 0; white-space: pre-wrap; }
+  .bad { color: #ff8a80; }
+</style>
+</head>
+<body>
+<pre id="out">GPU check: each operation runs on the CPU and on the GPU with the same input.
+</pre>
+<script type="module">
+// Runs every model in diag/tests.json on WASM and on WebGPU and prints how far the GPU result is from the CPU's.
+import * as ort from "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.31.1/dist/ort.webgpu.min.mjs";
+ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.31.1/dist/";
+const out = document.getElementById("out");
+const log = (s, bad) => {
+  const el = document.createElement("span");
+  if (bad) el.className = "bad";
+  el.textContent = s + "\n";
+  out.append(el);
+};
+try {
+  const ad = navigator.gpu && await navigator.gpu.requestAdapter();
+  if (!ad) throw new Error("this browser has no WebGPU adapter");
+  const i = ad.info || {};
+  log(`gpu: ${[i.vendor, i.architecture, i.device, i.description].filter(Boolean).join(" / ") || "unknown"}`);
+  log(`shader-f16: ${ad.features.has("shader-f16")}\n`);
+  log("     error    operation");
+  const tests = await (await fetch("diag/tests.json")).json();
+  for (const t of tests) {
+    try {
+      const bytes = new Uint8Array(await (await fetch("diag/" + t.file)).arrayBuffer());
+      const n = t.shape.reduce((a, b) => a * b, 1), x = new Float32Array(n);
+      let seed = 12345;                                        // same pseudo-random input for both runs
+      for (let k = 0; k < n; k++) { seed = (seed * 1664525 + 1013904223) >>> 0; x[k] = t.lo + (t.hi - t.lo) * seed / 4294967296; }
+      const run = async ep => {
+        const s = await ort.InferenceSession.create(bytes.slice(), { executionProviders: [ep] });
+        const y = Float32Array.from((await s.run({ x: new ort.Tensor("float32", x, t.shape) })).y.data);
+        await s.release();
+        return y;
+      };
+      const a = await run("wasm"), b = await run("webgpu");
+      let num = 0, den = 0, nan = 0;
+      for (let k = 0; k < a.length; k++) {
+        if (!Number.isFinite(b[k])) { nan++; continue; }
+        num += (a[k] - b[k]) ** 2; den += a[k] ** 2;
+      }
+      const rel = Math.sqrt(num / den), bad = nan > 0 || !(rel < 1e-3);
+      log(`${bad ? "BAD" : "ok "}  ${rel.toExponential(1)}  ${t.name}${nan ? `  (${nan} non-finite)` : ""}`, bad);
+    } catch (e) { log(`ERR            ${t.name}: ${e.message}`, true); }
+  }
+  log("\ndone");
+} catch (e) { log("could not run: " + e.message, true); }
+</script>
+</body>
+</html>

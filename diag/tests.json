@@ -1,0 +1,195 @@
+[
+ {
+  "name": "conv 16x16 (patch embed)",
+  "file": "t00.onnx",
+  "shape": [
+   1,
+   3,
+   160,
+   160
+  ],
+  "lo": 0,
+  "hi": 1
+ },
+ {
+  "name": "patch embed as matmul",
+  "file": "t01.onnx",
+  "shape": [
+   1,
+   3,
+   160,
+   160
+  ],
+  "lo": 0,
+  "hi": 1
+ },
+ {
+  "name": "LayerNormalization",
+  "file": "t02.onnx",
+  "shape": [
+   1,
+   101,
+   384
+  ],
+  "lo": -6,
+  "hi": 6
+ },
+ {
+  "name": "layer norm, primitive",
+  "file": "t03.onnx",
+  "shape": [
+   1,
+   101,
+   384
+  ],
+  "lo": -6,
+  "hi": 6
+ },
+ {
+  "name": "Softmax",
+  "file": "t04.onnx",
+  "shape": [
+   1,
+   6,
+   101,
+   101
+  ],
+  "lo": -8,
+  "hi": 8
+ },
+ {
+  "name": "softmax, primitive",
+  "file": "t05.onnx",
+  "shape": [
+   1,
+   6,
+   101,
+   101
+  ],
+  "lo": -8,
+  "hi": 8
+ },
+ {
+  "name": "GELU (Erf)",
+  "file": "t06.onnx",
+  "shape": [
+   1,
+   101,
+   1536
+  ],
+  "lo": -4,
+  "hi": 4
+ },
+ {
+  "name": "gelu, tanh form",
+  "file": "t07.onnx",
+  "shape": [
+   1,
+   101,
+   1536
+  ],
+  "lo": -4,
+  "hi": 4
+ },
+ {
+  "name": "linear (MatMul + Add)",
+  "file": "t08.onnx",
+  "shape": [
+   1,
+   101,
+   384
+  ],
+  "lo": -3,
+  "hi": 3
+ },
+ {
+  "name": "linear, f16 weights + Cast",
+  "file": "t09.onnx",
+  "shape": [
+   1,
+   101,
+   384
+  ],
+  "lo": -3,
+  "hi": 3
+ },
+ {
+  "name": "q k^T, rank-5 split",
+  "file": "t10.onnx",
+  "shape": [
+   1,
+   101,
+   384
+  ],
+  "lo": -3,
+  "hi": 3
+ },
+ {
+  "name": "q k^T, rank-4 split",
+  "file": "t11.onnx",
+  "shape": [
+   1,
+   101,
+   384
+  ],
+  "lo": -3,
+  "hi": 3
+ },
+ {
+  "name": "merge heads",
+  "file": "t12.onnx",
+  "shape": [
+   1,
+   6,
+   101,
+   64
+  ],
+  "lo": -2,
+  "hi": 2
+ },
+ {
+  "name": "cls token + position",
+  "file": "t13.onnx",
+  "shape": [
+   1,
+   100,
+   384
+  ],
+  "lo": -3,
+  "hi": 3
+ },
+ {
+  "name": "attention readout",
+  "file": "t14.onnx",
+  "shape": [
+   1,
+   6,
+   101,
+   101
+  ],
+  "lo": 0,
+  "hi": 1
+ },
+ {
+  "name": "block, standard ops",
+  "file": "t15.onnx",
+  "shape": [
+   1,
+   101,
+   384
+  ],
+  "lo": -3,
+  "hi": 3
+ },
+ {
+  "name": "block, primitive ops",
+  "file": "t16.onnx",
+  "shape": [
+   1,
+   101,
+   384
+  ],
+  "lo": -3,
+  "hi": 3
+ }
+]
