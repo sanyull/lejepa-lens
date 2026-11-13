@@ -9,26 +9,35 @@
   body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.4 system-ui, sans-serif; }
   main { max-width: 520px; margin: 0 auto; padding: 12px 16px 24px; }
   p { margin: 6px 0; color: var(--dim); }
-  canvas { width: 100%; display: block; border-radius: 10px; background: #000; touch-action: none; }
+  canvas { width: 100%; aspect-ratio: 1; display: block; border-radius: 10px; background: #000; touch-action: none; }
   .row { display: flex; gap: 8px; margin: 10px 0; align-items: center; }
   button { flex: 1; padding: 10px 6px; border: 0; border-radius: 8px; background: var(--card); color: var(--fg); font: inherit; }
   button.on { background: var(--acc); color: #111; font-weight: 600; }
   #status { font-size: 13px; font-variant-numeric: tabular-nums; }
   video { display: none; }
+  /* landscape: the picture fits the visible height, controls sit beside it */
+  @media (orientation: landscape) {
+    main { max-width: none; display: flex; gap: 16px; align-items: flex-start; padding: 8px 12px; }
+    canvas { width: min(calc(100vh - 16px), 60vw); width: min(calc(100dvh - 16px), 60vw); flex: none; }
+    #side { flex: 1; min-width: 0; }
+    #modes { margin-top: 0; }
+  }
 </style>
 </head>
 <body>
 <main>
   <canvas id="view" width="448" height="448"></canvas>
-  <div class="row" id="modes">
-    <button data-mode="colors" class="on">Colors</button>
-    <button data-mode="touch">Touch</button>
-    <button data-mode="focus">Focus</button>
+  <div id="side">
+    <div class="row" id="modes">
+      <button data-mode="colors" class="on">Colors</button>
+      <button data-mode="touch">Touch</button>
+      <button data-mode="focus">Focus</button>
+    </div>
+    <div class="row"><button id="lock">Lock colors</button></div>
+    <p id="status">Starting…</p>
+    <p>Everything runs on your device. No image leaves it.<br>
+       Model: LeJEPA ViT-S/16, a third-party reproduction by OK-AI (Apache-2.0).</p>
   </div>
-  <div class="row"><button id="lock">Lock colors</button></div>
-  <p id="status">Starting…</p>
-  <p>Everything runs on your device. No image leaves it.<br>
-     Model: LeJEPA ViT-S/16, a third-party reproduction by OK-AI (Apache-2.0).</p>
   <video id="video" playsinline muted></video>
 </main>
 
@@ -36,16 +45,16 @@
 import * as ort from "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.31.1/dist/ort.webgpu.min.mjs";
 ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.31.1/dist/";
 
-const G = 14, D = 384, N = G * G, R = 224, S = 448;
+const G = 14, D = 384, N = G * G, R = 224, S = 448, PS = 16;
 const qs = new URLSearchParams(location.search);
 const $ = id => document.getElementById(id);
 const view = $("view"), vctx = view.getContext("2d");
 const small = document.createElement("canvas"); small.width = small.height = R;
 const sctx = small.getContext("2d", { willReadFrequently: true });
-const ov = document.createElement("canvas"); ov.width = ov.height = G;
-const octx = ov.getContext("2d"), od = octx.createImageData(G, G);
+const ov = document.createElement("canvas"); ov.width = ov.height = R;
+const octx = ov.getContext("2d"), od = octx.createImageData(R, R);
 
-const state = window.demo = { mode: "colors", backend: "", ms: 0, fps: 0, frames: 0, locked: false };
+const state = window.demo = { mode: "colors", backend: "", ms: 0, fps: 0, frames: 0, locked: false, check: null };
 let session = null, src = null, busy = false, query = null;
 const setStatus = t => { $("status").textContent = t; };
 
@@ -67,6 +76,27 @@ async function fetchBytes(url, label) {
   return out;
 }
 
+// Run a fixed synthetic pattern and compare with reference features (check.bin, made by mkcheck.py).
+// Returns the mean cosine of mean-centred features over 8 patches, or null if there is no reference.
+const CHECK = [0, 27, 52, 77, 97, 122, 150, 195];
+async function fidelity(sess) {
+  const r = await fetch("check.bin");
+  if (!r.ok) return null;
+  const ref = new Float32Array(await r.arrayBuffer()), x = new Float32Array(3 * R * R), K = CHECK.length;
+  for (let c = 0; c < 3; c++) for (let y = 0; y < R; y++) for (let xx = 0; xx < R; xx++)
+    x[c * R * R + y * R + xx] = 0.5 + 0.25 * Math.sin(xx * 0.11 + c * 1.3) + 0.25 * Math.cos(y * 0.07 * (c + 1));
+  const f = (await sess.run({ image: new ort.Tensor("float32", x, [1, 3, R, R]) })).feat.data;
+  const mf = new Float32Array(D), mr = new Float32Array(D);
+  for (let k = 0; k < K; k++) for (let j = 0; j < D; j++) { mf[j] += f[CHECK[k] * D + j] / K; mr[j] += ref[k * D + j] / K; }
+  let tot = 0;
+  for (let k = 0; k < K; k++) {
+    let s = 0, a = 0, b = 0;
+    for (let j = 0; j < D; j++) { const u = f[CHECK[k] * D + j] - mf[j], v = ref[k * D + j] - mr[j]; s += u * v; a += u * u; b += v * v; }
+    tot += s / Math.sqrt(a * b);
+  }
+  return tot / K;
+}
+
 async function createSession() {
   if (qs.get("ep") !== "wasm" && navigator.gpu) {
     try {
@@ -74,7 +104,11 @@ async function createSession() {
       if (ad && ad.features.has("shader-f16")) {
         const bytes = await fetchBytes("model_fp16.onnx", "model");
         setStatus("Preparing model…");
-        return [await ort.InferenceSession.create(bytes, { executionProviders: ["webgpu"] }), "WebGPU"];
+        const s = await ort.InferenceSession.create(bytes, { executionProviders: ["webgpu"] });
+        state.check = await fidelity(s);
+        // some GPUs compute 16-bit floats too coarsely; fall back rather than show corrupted maps
+        if (state.check === null || state.check >= 0.95) return [s, "WebGPU"];
+        console.warn("WebGPU output differs from the reference, falling back to WASM. fidelity =", state.check);
       }
     } catch (e) { console.warn("WebGPU unavailable, falling back to WASM", e); }
   }
@@ -108,16 +142,54 @@ const dot = (a, b) => { let s = 0; for (let j = 0; j < D; j++) s += a[j] * b[j];
 const normalize = a => { const n = Math.sqrt(dot(a, a)) || 1; for (let j = 0; j < D; j++) a[j] /= n; };
 const clamp01 = t => t < 0 ? 0 : t > 1 ? 1 : t;
 const STOPS = [[0, 0, 4], [87, 16, 110], [188, 55, 84], [249, 142, 9], [252, 255, 164]];
-function heat(t, i, alpha) {
+function heat(t, o, alpha) {
   const x = clamp01(t) * 4, k = Math.min(3, x | 0), f = x - k, a = STOPS[k], b = STOPS[k + 1];
-  od.data[4 * i] = a[0] + (b[0] - a[0]) * f; od.data[4 * i + 1] = a[1] + (b[1] - a[1]) * f;
-  od.data[4 * i + 2] = a[2] + (b[2] - a[2]) * f; od.data[4 * i + 3] = 255 * alpha;
+  od.data[o] = a[0] + (b[0] - a[0]) * f; od.data[o + 1] = a[1] + (b[1] - a[1]) * f;
+  od.data[o + 2] = a[2] + (b[2] - a[2]) * f; od.data[o + 3] = 255 * alpha;
+}
+
+// Edge-aware upsampling (joint bilateral): each pixel takes the value of nearby patches whose
+// average color resembles the pixel, so the 14x14 map follows the edges of the camera image.
+const WS = new Float32Array(PS * PS * 9), WR = new Float32Array(1024), pm = new Float32Array(N * 3);
+for (let fy = 0; fy < PS; fy++) for (let fx = 0; fx < PS; fx++) for (let dy = -1, k = 0; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++, k++) {
+  const py = (fy + 0.5) / PS - 0.5 - dy, px = (fx + 0.5) / PS - 0.5 - dx;
+  WS[(fy * PS + fx) * 9 + k] = Math.exp(-(py * py + px * px) / 1.125);   // sigma = 0.75 patch
+}
+for (let i = 0; i < 1024; i++) WR[i] = Math.exp(-(i * 64 + 32) / 1872.7);   // color sigma = 0.12 of full range
+function patchMeans(px) {
+  pm.fill(0);
+  for (let y = 0; y < R; y++) for (let x = 0; x < R; x++) {
+    const p = ((y >> 4) * G + (x >> 4)) * 3, o = (y * R + x) * 4;
+    pm[p] += px[o]; pm[p + 1] += px[o + 1]; pm[p + 2] += px[o + 2];
+  }
+  for (let i = 0; i < N * 3; i++) pm[i] /= PS * PS;
+}
+function upsample(vals, C, px, write) {
+  for (let y = 0; y < R; y++) {
+    const cy = y >> 4, fy = y & 15;
+    for (let x = 0; x < R; x++) {
+      const cx = x >> 4, o = (y * R + x) * 4, r = px[o], g = px[o + 1], b = px[o + 2];
+      let s0 = 0, s1 = 0, s2 = 0, den = 0, wi = (fy * PS + (x & 15)) * 9;
+      for (let dy = -1; dy <= 1; dy++) {
+        const qy = cy + dy < 0 ? 0 : cy + dy > G - 1 ? G - 1 : cy + dy;
+        for (let dx = -1; dx <= 1; dx++, wi++) {
+          const qx = cx + dx < 0 ? 0 : cx + dx > G - 1 ? G - 1 : cx + dx, q = qy * G + qx, m = q * 3;
+          const dr = (r - pm[m]) ** 2 + (g - pm[m + 1]) ** 2 + (b - pm[m + 2]) ** 2;
+          const w = WS[wi] * WR[Math.min(1023, dr >> 6)] + 1e-6;
+          den += w; s0 += w * vals[q * C];
+          if (C === 3) { s1 += w * vals[q * C + 1]; s2 += w * vals[q * C + 2]; }
+        }
+      }
+      write(o, s0 / den, s1 / den, s2 / den);
+    }
+  }
 }
 
 // PCA basis tracked by warm-started power iteration, so colors drift slowly instead of flipping
 const mu = new Float32Array(D), V = [0, 1, 2].map(() => Float32Array.from({ length: D }, () => Math.random() - 0.5));
 const lo = new Float32Array(3), hi = new Float32Array(3);
-const Xc = new Float32Array(N * D), proj = new Float32Array(N), tmp = new Float32Array(D), Y = new Float32Array(N * 3);
+const Xc = new Float32Array(N * D), proj = new Float32Array(N), tmp = new Float32Array(D);
+const Y = new Float32Array(N * 3), T = new Float32Array(N);
 let pcaReady = false;
 function center(feat) {
   for (let i = 0; i < N; i++) for (let j = 0; j < D; j++) Xc[i * D + j] = feat[i * D + j] - mu[j];
@@ -139,7 +211,7 @@ function updateBasis(feat) {
     normalize(v);
   }
 }
-function colors(feat) {
+function colors(feat, px) {
   const first = !pcaReady;
   if (!state.locked || first) updateBasis(feat); else center(feat);
   for (let k = 0; k < 3; k++) {
@@ -157,32 +229,41 @@ function colors(feat) {
     }
   }
   pcaReady = true;
-  for (let i = 0; i < N; i++) {
-    let sat = 0;
-    for (let k = 0; k < 3; k++) {
-      const c = clamp01((Y[i * 3 + k] - lo[k]) / (hi[k] - lo[k]));
-      od.data[4 * i + k] = 255 * c;
-      sat = Math.max(sat, Math.abs(c - 0.5) * 2);
-    }
-    // automatic overlay strength: distinctive patches get more color, ambiguous ones show the camera
-    od.data[4 * i + 3] = 255 * (0.55 + 0.35 * sat);
-  }
+  for (let i = 0; i < N; i++) for (let k = 0; k < 3; k++) Y[i * 3 + k] = clamp01((Y[i * 3 + k] - lo[k]) / (hi[k] - lo[k]));
+  upsample(Y, 3, px, (o, r, g, b) => {
+    od.data[o] = 255 * r; od.data[o + 1] = 255 * g; od.data[o + 2] = 255 * b; od.data[o + 3] = 191;
+  });
 }
-function touch(feat) {
+function touch(feat, px) {
   if (!query) { od.data.fill(0); return; }
   for (let i = 0; i < N; i++) {
     let s = 0, n = 0;
     for (let j = 0; j < D; j++) { const f = feat[i * D + j]; s += f * query[j]; n += f * f; }
-    // spotlight: similar patches stay lit, the rest is dimmed
-    const t = clamp01((s / Math.sqrt(n) - 0.35) / 0.5);
-    od.data[4 * i] = od.data[4 * i + 1] = od.data[4 * i + 2] = 0;
-    od.data[4 * i + 3] = 230 * (1 - t);
+    T[i] = clamp01((s / Math.sqrt(n) - 0.35) / 0.5);
   }
+  // spotlight: similar regions stay lit, the rest is dimmed
+  upsample(T, 1, px, (o, t) => { od.data[o] = od.data[o + 1] = od.data[o + 2] = 0; od.data[o + 3] = 230 * (1 - t); });
 }
-function focus(attn) {
-  let mx = 0;
-  for (let i = 0; i < N; i++) mx = Math.max(mx, attn[i]);
-  for (let i = 0; i < N; i++) { const t = attn[i] / mx; heat(t, i, Math.sqrt(t)); }
+// Border patches attract attention whatever the scene shows, so they are damped. The map is then
+// scored against its own spread: a scene with nothing salient stays dark instead of amplifying noise.
+const TAPER = Float32Array.from({ length: N }, (_, i) => {
+  const y = (i / G) | 0, x = i % G, ey = y === 0 || y === G - 1, ex = x === 0 || x === G - 1;
+  return ey && ex ? 0.25 : ey || ex ? 0.5 : 1;
+});
+const A = new Float32Array(N);
+let focusReady = false;
+function focus(attn, px) {
+  let m = 0, v = 0;
+  for (let i = 0; i < N; i++) { A[i] = attn[i] * TAPER[i]; m += A[i]; }
+  m /= N;
+  for (let i = 0; i < N; i++) v += (A[i] - m) ** 2;
+  const sd = Math.sqrt(v / N) || 1;
+  for (let i = 0; i < N; i++) {
+    const t = clamp01(((A[i] - m) / sd - 1.5) / 3.5);
+    T[i] = focusReady ? 0.5 * T[i] + 0.5 * t : t;          // light smoothing over time
+  }
+  focusReady = true;
+  upsample(T, 1, px, (o, t) => heat(0.25 + 0.75 * t, o, Math.sqrt(t) * 0.9));
 }
 
 // ---------- frame
@@ -198,10 +279,11 @@ async function step() {
   state.frames++;
   state.feat = feat;
 
+  patchMeans(px);
+  if (state.mode === "colors") colors(feat, px);
+  else if (state.mode === "touch") touch(feat, px);
+  else focus(out.attn.data, px);
   drawSquare(vctx, S);
-  if (state.mode === "colors") colors(feat);
-  else if (state.mode === "touch") touch(feat);
-  else focus(out.attn.data);
   octx.putImageData(od, 0, 0);
   vctx.imageSmoothingEnabled = true;
   vctx.drawImage(ov, 0, 0, S, S);
@@ -226,6 +308,7 @@ function setMode(m) {
   state.mode = m;
   for (const b of $("modes").children) b.classList.toggle("on", b.dataset.mode === m);
   $("lock").parentElement.style.display = m === "colors" ? "" : "none";
+  focusReady = false;
 }
 $("modes").addEventListener("click", e => { if (e.target.dataset.mode) setMode(e.target.dataset.mode); });
 $("lock").addEventListener("click", () => {
