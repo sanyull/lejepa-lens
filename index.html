@@ -77,13 +77,16 @@ const save = (k, v) => { try { localStorage.setItem(k, v); } catch (e) { /* stor
 // by them is (re)allocated here: the GPU and CPU paths may use different sizes.
 // The map canvases are larger than the map by a margin PADM on every side (PW across), filled by
 // repeating the map's border pixels, so a map drawn displaced still covers the whole picture.
-let R, G, N, CHECK, PADM, PW, od, od32, input, pm, Xc, proj, Y, T, A, TAPER, y0, bandH, pcaReady, focusReady;
+let R, G, N, CHECK, PADM, PW, FADE, od, od32, input, pm, Xc, proj, Y, T, A, TAPER, vx, vy, vw, vh, pcaReady, focusReady;
 let lastFrame = -1, lastMap = -1, mapVer = 0;      // what the screen currently shows
 const wideQ = matchMedia("(orientation: landscape) and (max-height: 500px)");
+// The model sees a centred square; the screen shows only the middle VIS of it (a 16:9 band of that on
+// a phone held sideways). The part outside is a guard band: when the camera moves, what slides into
+// view already has a real map, so nothing has to be made up at the edges.
+const VIS = 0.8;
 function layout() {
-  // the model always sees a centred square; a phone held sideways shows the middle band of it (16:9)
-  bandH = wideQ.matches ? R * 9 / 16 : R;
-  y0 = (R - bandH) / 2;
+  vw = R * VIS; vh = wideQ.matches ? vw * 9 / 16 : vw;       // the visible rectangle, in model pixels
+  vx = (R - vw) / 2; vy = (R - vh) / 2;
   view.width = wideQ.matches ? 640 : 448;
   view.height = wideQ.matches ? 360 : 448;
   lastFrame = -1;
@@ -96,6 +99,7 @@ function setup(res) {
   ov.width = ov.height = prev.width = prev.height = mix.width = mix.height = PW;
   od = octx.createImageData(PW, PW);
   od32 = new Uint32Array(od.data.buffer);
+  FADE = Float32Array.from({ length: PADM + 1 }, (_, d) => (1 - d / PADM) ** 2);   // opacity of the margin by distance
   input = new Float32Array(3 * R * R);
   pm = new Float32Array(N * 3); Xc = new Float32Array(N * D); proj = new Float32Array(N);
   Y = new Float32Array(N * 3); T = new Float32Array(N); A = new Float32Array(N);
@@ -346,7 +350,9 @@ const ring = Array.from({ length: RING }, () => {
   return { c, ctx: c.getContext("2d"), t: -1, th: new Float32Array(TH * TH) };
 });
 let head = 0, delay = 0, fresh = false;
+const ema = (k, v) => { state[k] = state[k] ? 0.8 * state[k] + 0.2 * v : v; };   // smoothed timings, shown by ?debug=1
 function pushFrame(now) {
+  if (ring[head].t >= 0) ema("camMs", now - ring[head].t);
   head = (head + 1) % RING;
   const f = ring[head];
   drawSource(f.ctx, 0, 1, RS, RS);
@@ -371,15 +377,24 @@ function storePerVideoFrame(v) {
 
 // A map drawn displaced would leave a strip of the picture uncovered, so the map's border pixels are
 // repeated into the margin around it. This is done on the pixel data, before the map reaches a canvas.
+// The repeated pixels are only a guess at what lies beyond the map, so they fade out with distance.
 function padEdges() {
-  const M = PADM, ya = Math.floor(y0) + M, yb = Math.ceil(y0 + bandH) + M;
-  for (let y = ya; y < yb; y++) {
+  const M = PADM, E = M + R, d = od.data;
+  for (let y = M; y < E; y++) {
     const row = y * PW;
     od32.fill(od32[row + M], row, row + M);
-    od32.fill(od32[row + M + R - 1], row + M + R, row + PW);
+    od32.fill(od32[row + E - 1], row + E, row + PW);
   }
-  for (let y = ya - M; y < ya; y++) od32.copyWithin(y * PW, ya * PW, ya * PW + PW);
-  for (let y = yb; y < yb + M; y++) od32.copyWithin(y * PW, (yb - 1) * PW, yb * PW);
+  for (let y = 0; y < M; y++) od32.copyWithin(y * PW, M * PW, M * PW + PW);
+  for (let y = E; y < PW; y++) od32.copyWithin(y * PW, (E - 1) * PW, E * PW);
+  for (let y = 0; y < PW; y++) {
+    const dy = y < M ? M - y : y >= E ? y - E + 1 : 0, row = y * PW * 4 + 3;
+    for (let x = 0; x < PW; x++) {
+      if (dy === 0 && x === M) x = E;                       // skip the map itself
+      const dx = x < M ? M - x : x - E + 1;
+      d[row + x * 4] *= FADE[dx > dy ? dx : dy];
+    }
+  }
 }
 
 // ---------- maths
@@ -414,7 +429,7 @@ function patchMeans(px) {
   for (let i = 0; i < N * 3; i++) pm[i] /= PS * PS;
 }
 function upsample(vals, C, px, write, wr = WR) {
-  for (let y = Math.floor(y0), ye = Math.ceil(y0 + bandH); y < ye; y++) {   // only the rows on screen
+  for (let y = 0; y < R; y++) {
     const cy = y >> 4, fy = y & 15;
     for (let x = 0; x < R; x++) {
       const cx = x >> 4, o = (y * R + x) * 4, r = px[o], g = px[o + 1], b = px[o + 2];
@@ -519,7 +534,9 @@ function draw(now) {
   // nothing new to show: same camera picture, same map, no fade in progress
   if (f.t === lastFrame && mapVer === lastMap && a >= 1 && settled) return;
   lastFrame = f.t; lastMap = mapVer;
-  vctx.drawImage(f.c, 0, RS * y0 / R, RS, RS * bandH / R, 0, 0, view.width, view.height);
+  const td = performance.now();
+  const q = RS / R;
+  vctx.drawImage(f.c, vx * q, vy * q, vw * q, vh * q, 0, 0, view.width, view.height);
   if (!hasMap) return;
   // follow the camera: how far is this frame from the one the map was computed from?
   shift = fresh ? estimateShift(refT, f.th, 0, 0, 6) : estimateShift(refT, f.th, shift[0], shift[1]);
@@ -541,8 +558,9 @@ function draw(now) {
   if (settled) gain = target;
   vctx.imageSmoothingEnabled = true;
   vctx.globalAlpha = gain;
-  vctx.drawImage(top, PADM - shift[0] * k, PADM + y0 - shift[1] * k, R, bandH, 0, 0, view.width, view.height);
+  vctx.drawImage(top, PADM + vx - shift[0] * k, PADM + vy - shift[1] * k, vw, vh, 0, 0, view.width, view.height);
   vctx.globalAlpha = 1;
+  ema("drawMs", performance.now() - td);
 }
 function frameLoop(now) { draw(now); requestAnimationFrame(frameLoop); }
 state.draw = draw;                              // exposed for tests
@@ -553,6 +571,7 @@ const tick = () => document.hidden
 async function inferLoop() {
   let last = 0;
   for (;;) {
+    const ts = performance.now();
     drawSource(sctx, 0, 1, R, R);               // the model's input, straight from the camera
     grabThumb(capT);                            // the same picture, kept as the next map's reference
     const tc = performance.now();
@@ -584,7 +603,10 @@ async function inferLoop() {
     fresh = true;
     fadeT0 = t2; fadeMs = Math.min(100, gap);
     hasMap = true;
-    const dbg = qs.get("debug") ? ` · ${R}px · ${state.note} · threads ${state.threads} · delay ${delay.toFixed(0)}` : "";
+    ema("preMs", t0 - ts); ema("postMs", t2 - t1);
+    const n0 = v => (v || 0).toFixed(0);
+    const dbg = qs.get("debug") ? ` · ${R}px · ${state.note} · threads ${state.threads} · delay ${delay.toFixed(0)}`
+      + ` · pre ${n0(state.preMs)} · post ${n0(state.postMs)} · draw ${n0(state.drawMs)} · camera every ${n0(state.camMs)} ms` : "";
     setStatus(`${state.backend} · ${state.ms.toFixed(0)} ms/frame · ${state.fps.toFixed(1)} fps${dbg}`);
     await tick();
   }
@@ -607,8 +629,8 @@ $("lock").addEventListener("click", () => {
 view.addEventListener("pointerdown", e => {
   if (state.mode !== "touch" || !state.feat) return;
   const r = view.getBoundingClientRect();
-  const gx = Math.min(G - 1, Math.floor((e.clientX - r.left) / r.width * G));
-  const gy = Math.min(G - 1, Math.floor((y0 + (e.clientY - r.top) / r.height * bandH) / PS));
+  const gx = Math.min(G - 1, Math.floor((vx + (e.clientX - r.left) / r.width * vw) / PS));
+  const gy = Math.min(G - 1, Math.floor((vy + (e.clientY - r.top) / r.height * vh) / PS));
   query = Float32Array.from(state.feat.subarray((gy * G + gx) * D, (gy * G + gx + 1) * D));
   normalize(query);
 });
