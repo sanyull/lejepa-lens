@@ -289,10 +289,10 @@ const TH = 48, MAXS = 16;
 const thumb = document.createElement("canvas"); thumb.width = thumb.height = TH;
 const tctx = thumb.getContext("2d", { willReadFrequently: true });
 tctx.imageSmoothingQuality = "medium";
-const refT = new Float32Array(TH * TH), capT = new Float32Array(TH * TH), curT = new Float32Array(TH * TH);
-let shift = [0, 0], capShift = [0, 0], curShift0 = [0, 0], prevShift0 = [0, 0];   // in thumbnail pixels
-function grabThumb(out) {                       // zero-mean brightness of the centred square
-  drawSource(tctx, 0, 1, TH, TH);
+const refT = new Float32Array(TH * TH), capT = new Float32Array(TH * TH);
+let shift = [0, 0], curShift0 = [0, 0], prevShift0 = [0, 0];   // in thumbnail pixels
+function grabThumb(out, canvas) {               // zero-mean brightness of a square frame
+  tctx.drawImage(canvas, 0, 0, canvas.width, canvas.height, 0, 0, TH, TH);
   const d = tctx.getImageData(0, 0, TH, TH).data;
   let m = 0;
   for (let i = 0; i < TH * TH; i++) { out[i] = 0.299 * d[4 * i] + 0.587 * d[4 * i + 1] + 0.114 * d[4 * i + 2]; m += out[i]; }
@@ -308,10 +308,10 @@ function sad(ref, cur, dx, dy) {                // mean |cur(x + dx, y + dy) - r
   }
   return s / ((xb - xa) * (yb - ya));
 }
-function estimateShift(ref, cur, gx, gy) {      // search +-3 around the guess, then refine below one pixel
+function estimateShift(ref, cur, gx, gy, rad = 3) {   // search around the guess, then refine below one pixel
   const cx = Math.round(gx), cy = Math.round(gy);
   let best = Infinity, bx = 0, by = 0;
-  for (let dy = cy - 3; dy <= cy + 3; dy++) for (let dx = cx - 3; dx <= cx + 3; dx++) {
+  for (let dy = cy - rad; dy <= cy + rad; dy++) for (let dx = cx - rad; dx <= cx + rad; dx++) {
     if (Math.abs(dx) > MAXS || Math.abs(dy) > MAXS) continue;
     const s = sad(ref, cur, dx, dy);
     if (s < best) { best = s; bx = dx; by = dy; }
@@ -323,6 +323,31 @@ function estimateShift(ref, cur, gx, gy) {      // search +-3 around the guess, 
   return [bx + fx, by + fy];
 }
 state.estimateShift = estimateShift;            // exposed for tests
+
+// ---------- delayed preview
+// A map needs about one inference to arrive. Showing the camera that much late means the map appears
+// on exactly the frame it was computed from; motion tracking then only has to cover the time until
+// the next map. Recent frames are kept in a ring, each with its thumbnail.
+const RS = 448, RING = 24;
+const ring = Array.from({ length: RING }, () => {
+  const c = document.createElement("canvas");
+  c.width = c.height = RS;
+  return { c, ctx: c.getContext("2d"), t: -1, th: new Float32Array(TH * TH) };
+});
+let head = 0, delay = 0, fresh = false;
+function pushFrame(now) {
+  head = (head + 1) % RING;
+  const f = ring[head];
+  drawSource(f.ctx, 0, 1, RS, RS);
+  grabThumb(f.th, f.c);
+  f.t = now;
+  return f;
+}
+function frameAt(t) {                           // the kept frame closest to time t
+  let best = ring[head];
+  for (const f of ring) if (f.t >= 0 && Math.abs(f.t - t) < Math.abs(best.t - t)) best = f;
+  return best;
+}
 
 // ---------- maths
 const dot = (a, b) => { let s = 0; for (let j = 0; j < D; j++) s += a[j] * b[j]; return s; };
@@ -337,12 +362,16 @@ function heat(t, o, alpha) {
 
 // Edge-aware upsampling (joint bilateral): each pixel takes the value of nearby patches whose
 // average color resembles the pixel, so the patch map follows the edges of the camera image.
-const WS = new Float32Array(PS * PS * 9), WR = new Float32Array(1024);
-for (let fy = 0; fy < PS; fy++) for (let fx = 0; fx < PS; fx++) for (let dy = -1, k = 0; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++, k++) {
-  const py = (fy + 0.5) / PS - 0.5 - dy, px = (fx + 0.5) / PS - 0.5 - dx;
-  WS[(fy * PS + fx) * 9 + k] = Math.exp(-(py * py + px * px) / 1.125);   // sigma = 0.75 patch
+// The spatial weight is a quadratic B-spline: it falls to zero at the edge of the 3x3 neighbourhood,
+// so the result has no seams along patch borders.
+const WS = new Float32Array(PS * PS * 9), WR = new Float32Array(1024), WR_SOFT = new Float32Array(1024);
+const bspline = t => { t = Math.abs(t); return t <= 0.5 ? 0.75 - t * t : t <= 1.5 ? 0.5 * (1.5 - t) ** 2 : 0; };
+for (let fy = 0; fy < PS; fy++) for (let fx = 0; fx < PS; fx++) for (let dy = -1, k = 0; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++, k++)
+  WS[(fy * PS + fx) * 9 + k] = bspline((fy + 0.5) / PS - 0.5 - dy) * bspline((fx + 0.5) / PS - 0.5 - dx);
+for (let i = 0; i < 1024; i++) {
+  WR[i] = Math.exp(-(i * 64 + 32) / 1872.7);        // color sigma = 0.12 of full range: follows edges closely
+  WR_SOFT[i] = Math.exp(-(i * 64 + 32) / 15930);    // color sigma = 0.35: mostly smooth, for the Focus glow
 }
-for (let i = 0; i < 1024; i++) WR[i] = Math.exp(-(i * 64 + 32) / 1872.7);   // color sigma = 0.12 of full range
 function patchMeans(px) {
   pm.fill(0);
   for (let y = 0; y < R; y++) for (let x = 0; x < R; x++) {
@@ -351,7 +380,7 @@ function patchMeans(px) {
   }
   for (let i = 0; i < N * 3; i++) pm[i] /= PS * PS;
 }
-function upsample(vals, C, px, write) {
+function upsample(vals, C, px, write, wr = WR) {
   for (let y = Math.floor(y0), ye = Math.ceil(y0 + bandH); y < ye; y++) {   // only the rows on screen
     const cy = y >> 4, fy = y & 15;
     for (let x = 0; x < R; x++) {
@@ -362,7 +391,7 @@ function upsample(vals, C, px, write) {
         for (let dx = -1; dx <= 1; dx++, wi++) {
           const qx = cx + dx < 0 ? 0 : cx + dx > G - 1 ? G - 1 : cx + dx, q = qy * G + qx, m = q * 3;
           const dr = (r - pm[m]) ** 2 + (g - pm[m + 1]) ** 2 + (b - pm[m + 2]) ** 2;
-          const w = WS[wi] * WR[Math.min(1023, dr >> 6)] + 1e-6;
+          const w = WS[wi] * (wr[Math.min(1023, dr >> 6)] + 1e-4);
           den += w; s0 += w * vals[q * C];
           if (C === 3) { s1 += w * vals[q * C + 1]; s2 += w * vals[q * C + 2]; }
         }
@@ -441,18 +470,22 @@ function focus(attn, px) {
     T[i] = focusReady ? 0.5 * T[i] + 0.5 * t : t;          // light smoothing over time
   }
   focusReady = true;
-  upsample(T, 1, px, (o, t) => heat(0.25 + 0.75 * t, o, Math.sqrt(t) * 0.9));
+  // a soft glow: smooth between patches, only loosely tied to the image's edges
+  upsample(T, 1, px, (o, t) => { t = Math.min(1, 1.4 * t); heat(0.25 + 0.75 * t, o, Math.sqrt(t) * 0.9); }, WR_SOFT);
 }
 
 // ---------- frames
-// The camera is drawn on every animation frame; the map on top is whatever the model last produced.
-function draw() {
+// Every animation frame stores the camera picture, then shows the one from `delay` ago with the map
+// the model last produced on top.
+function draw(now) {
   if (src) {
-    drawSource(vctx, y0 / R, bandH / R, view.width, view.height);
+    if (now - ring[head].t > 12) pushFrame(now);            // at most about 60 stored frames a second
+    const f = delay ? frameAt(now - delay) : ring[head];
+    vctx.drawImage(f.c, 0, RS * y0 / R, RS, RS * bandH / R, 0, 0, view.width, view.height);
     if (hasMap) {
-      // follow the camera: how far has the picture moved since the frame this map was computed from?
-      grabThumb(curT);
-      shift = estimateShift(refT, curT, shift[0], shift[1]);
+      // follow the camera: how far is this frame from the one the map was computed from?
+      shift = fresh ? estimateShift(refT, f.th, 0, 0, 6) : estimateShift(refT, f.th, shift[0], shift[1]);
+      if (fresh) { curShift0 = shift; fresh = false; }
       state.shift = shift;
       const k = R / TH;
       // cross-fade from the previous map over about one inference interval, so updates do not pop
@@ -470,12 +503,19 @@ function draw() {
   }
   requestAnimationFrame(draw);
 }
+// Between results the loop yields for one task (not a whole animation frame); it sleeps while the tab is hidden.
+const tick = () => document.hidden
+  ? new Promise(r => document.addEventListener("visibilitychange", r, { once: true }))
+  : new Promise(r => setTimeout(r, 0));
 async function inferLoop() {
   let last = 0;
   for (;;) {
-    drawSource(sctx, 0, 1, R, R);
-    grabThumb(capT);                            // the same frame, kept as the next map's reference
-    capShift = shift;
+    // the newest stored frame is the model's input (store one now if the preview is not running)
+    let f = ring[head];
+    if (f.t < 0 || performance.now() - f.t > 100) f = pushFrame(performance.now());
+    const tc = f.t;
+    capT.set(f.th);                             // kept as the next map's reference
+    sctx.drawImage(f.c, 0, 0, RS, RS, 0, 0, R, R);
     const px = sctx.getImageData(0, 0, R, R).data, n = R * R;
     for (let i = 0; i < n; i++) { input[i] = px[4 * i] / 255; input[n + i] = px[4 * i + 1] / 255; input[2 * n + i] = px[4 * i + 2] / 255; }
     const t0 = performance.now();
@@ -493,16 +533,18 @@ async function inferLoop() {
     else if (state.mode === "touch") touch(feat, px);
     else focus(attn, px);
     if (hasMap) { pctx.globalCompositeOperation = "copy"; pctx.drawImage(ov, 0, 0); hasPrev = true; }
-    // the new map belongs to the frame grabbed before the model ran; it has moved since then
     prevShift0 = shift;
-    shift = curShift0 = hasMap ? [shift[0] - capShift[0], shift[1] - capShift[1]] : [0, 0];
     refT.set(capT);
     octx.putImageData(od, 0, 0);
-    fadeT0 = performance.now(); fadeMs = Math.min(500, gap);
+    // the preview runs this far behind, so the map appears on the very frame it was computed from
+    const t2 = performance.now();
+    delay = Math.min(300, delay ? 0.8 * delay + 0.2 * (t2 - tc) : t2 - tc);
+    fresh = true;
+    fadeT0 = t2; fadeMs = Math.min(100, gap);
     hasMap = true;
-    const dbg = qs.get("debug") ? ` · ${R}px · ${state.note} · threads ${state.threads}` : "";
+    const dbg = qs.get("debug") ? ` · ${R}px · ${state.note} · threads ${state.threads} · delay ${delay.toFixed(0)}` : "";
     setStatus(`${state.backend} · ${state.ms.toFixed(0)} ms/frame · ${state.fps.toFixed(1)} fps${dbg}`);
-    await new Promise(requestAnimationFrame);   // yield to the preview; also pauses while the tab is hidden
+    await tick();
   }
 }
 
