@@ -17,6 +17,7 @@
   #fs { position: absolute; top: 8px; right: 8px; width: 36px; height: 36px; padding: 8px; background: rgba(0, 0, 0, .45); color: #fff; }
   #fs svg { display: block; width: 100%; height: 100%; }
   #status { font-size: 13px; font-variant-numeric: tabular-nums; }
+  #note { font-size: min(13.5px, 3.7vw); }   /* small enough for the first sentence to fit one line on a phone */
   video { display: none; }
   /* landscape: the picture fits the visible height, controls sit beside it */
   @media (orientation: landscape) {
@@ -45,7 +46,7 @@
     </div>
     <div class="row"><button id="lock">Lock colors</button></div>
     <p id="status">Starting…</p>
-    <p>Everything runs on your device. No image leaves it.<br>
+    <p id="note">Everything runs on your device. No image leaves it.<br>
        Model: LeJEPA ViT-S/16, a third-party reproduction by OK-AI (Apache-2.0).</p>
   </div>
   <video id="video" playsinline muted></video>
@@ -268,6 +269,7 @@ async function startCamera() {
   v.srcObject = stream;
   await v.play();
   src = v;
+  storePerVideoFrame(v);
 }
 const useImage = url => new Promise((res, rej) => {
   const im = new Image();
@@ -291,8 +293,12 @@ const tctx = thumb.getContext("2d", { willReadFrequently: true });
 tctx.imageSmoothingQuality = "medium";
 const refT = new Float32Array(TH * TH), capT = new Float32Array(TH * TH);
 let shift = [0, 0], curShift0 = [0, 0], prevShift0 = [0, 0];   // in thumbnail pixels
+// Shrinking happens on a GPU canvas first, so reading the thumbnail back copies 160x160 pixels, not the frame.
+const mid = document.createElement("canvas"); mid.width = mid.height = 160;
+const midctx = mid.getContext("2d");
 function grabThumb(out, canvas) {               // zero-mean brightness of a square frame
-  tctx.drawImage(canvas, 0, 0, canvas.width, canvas.height, 0, 0, TH, TH);
+  midctx.drawImage(canvas, 0, 0, canvas.width, canvas.height, 0, 0, 160, 160);
+  tctx.drawImage(mid, 0, 0, 160, 160, 0, 0, TH, TH);
   const d = tctx.getImageData(0, 0, TH, TH).data;
   let m = 0;
   for (let i = 0; i < TH * TH; i++) { out[i] = 0.299 * d[4 * i] + 0.587 * d[4 * i + 1] + 0.114 * d[4 * i + 2]; m += out[i]; }
@@ -347,6 +353,34 @@ function frameAt(t) {                           // the kept frame closest to tim
   let best = ring[head];
   for (const f of ring) if (f.t >= 0 && Math.abs(f.t - t) < Math.abs(best.t - t)) best = f;
   return best;
+}
+// A camera delivers about 30 pictures a second while the screen refreshes at 60 or more. Where the
+// browser can say when a new camera picture arrives, frames are stored once per picture.
+let perVideoFrame = false;
+function storePerVideoFrame(v) {
+  if (!v.requestVideoFrameCallback) return;
+  perVideoFrame = true;
+  const onFrame = now => { pushFrame(now); v.requestVideoFrameCallback(onFrame); };
+  v.requestVideoFrameCallback(onFrame);
+}
+
+// A map drawn displaced leaves a strip of the picture uncovered. The map is therefore extended past
+// its borders by repeating its edge rows and columns.
+const padc = document.createElement("canvas"), xctx = padc.getContext("2d");
+function padMap(c, M) {                         // region (0, y0, R, bandH) of c -> padc, with a margin M
+  const h = Math.round(bandH), y = Math.round(y0);
+  if (padc.width !== R + 2 * M || padc.height !== h + 2 * M) { padc.width = R + 2 * M; padc.height = h + 2 * M; }
+  xctx.globalCompositeOperation = "copy";
+  xctx.drawImage(c, 0, y, R, h, M, M, R, h);
+  xctx.globalCompositeOperation = "source-over";
+  xctx.drawImage(c, 0, y, R, 1, M, 0, R, M);                       // top
+  xctx.drawImage(c, 0, y + h - 1, R, 1, M, M + h, R, M);           // bottom
+  xctx.drawImage(c, 0, y, 1, h, 0, M, M, h);                       // left
+  xctx.drawImage(c, R - 1, y, 1, h, M + R, M, M, h);               // right
+  xctx.drawImage(c, 0, y, 1, 1, 0, 0, M, M);                       // corners
+  xctx.drawImage(c, R - 1, y, 1, 1, M + R, 0, M, M);
+  xctx.drawImage(c, 0, y + h - 1, 1, 1, 0, M + h, M, M);
+  xctx.drawImage(c, R - 1, y + h - 1, 1, 1, M + R, M + h, M, M);
 }
 
 // ---------- maths
@@ -479,7 +513,7 @@ function focus(attn, px) {
 // the model last produced on top.
 function draw(now) {
   if (src) {
-    if (now - ring[head].t > 12) pushFrame(now);            // at most about 60 stored frames a second
+    if (!perVideoFrame && now - ring[head].t > 12) pushFrame(now);   // at most about 60 stored frames a second
     const f = delay ? frameAt(now - delay) : ring[head];
     vctx.drawImage(f.c, 0, RS * y0 / R, RS, RS * bandH / R, 0, 0, view.width, view.height);
     if (hasMap) {
@@ -497,12 +531,15 @@ function draw(now) {
         mctx.globalCompositeOperation = "lighter"; mctx.globalAlpha = a; mctx.drawImage(ov, 0, 0);
         top = mix;
       }
+      const M = Math.ceil(MAXS * k) + 1;
+      padMap(top, M);
       vctx.imageSmoothingEnabled = true;
-      vctx.drawImage(top, -shift[0] * k, y0 - shift[1] * k, R, bandH, 0, 0, view.width, view.height);
+      vctx.drawImage(padc, M - shift[0] * k, M - shift[1] * k, R, Math.round(bandH), 0, 0, view.width, view.height);
     }
   }
-  requestAnimationFrame(draw);
 }
+function frameLoop(now) { draw(now); requestAnimationFrame(frameLoop); }
+state.draw = draw;                              // exposed for tests
 // Between results the loop yields for one task (not a whole animation frame); it sleeps while the tab is hidden.
 const tick = () => document.hidden
   ? new Promise(r => document.addEventListener("visibilitychange", r, { once: true }))
@@ -597,7 +634,7 @@ async function isolate() {
   } catch (e) { console.warn("service worker unavailable; WASM will use one thread", e); }
 }
 
-requestAnimationFrame(draw);
+requestAnimationFrame(frameLoop);
 try {
   await isolate();
   // camera starts on load; ?img=test.jpg swaps in a still image for self-testing
