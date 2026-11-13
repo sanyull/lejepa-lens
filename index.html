@@ -1,0 +1,252 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LeJEPA Lens</title>
+<style>
+  :root { --bg: #0f1115; --fg: #e8e8ea; --dim: #9aa0aa; --acc: #ffd166; --card: #1a1d24; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.4 system-ui, sans-serif; }
+  main { max-width: 520px; margin: 0 auto; padding: 12px 16px 24px; }
+  p { margin: 6px 0; color: var(--dim); }
+  canvas { width: 100%; display: block; border-radius: 10px; background: #000; touch-action: none; }
+  .row { display: flex; gap: 8px; margin: 10px 0; align-items: center; }
+  button { flex: 1; padding: 10px 6px; border: 0; border-radius: 8px; background: var(--card); color: var(--fg); font: inherit; }
+  button.on { background: var(--acc); color: #111; font-weight: 600; }
+  #status { font-size: 13px; font-variant-numeric: tabular-nums; }
+  video { display: none; }
+</style>
+</head>
+<body>
+<main>
+  <canvas id="view" width="448" height="448"></canvas>
+  <div class="row" id="modes">
+    <button data-mode="colors" class="on">Colors</button>
+    <button data-mode="touch">Touch</button>
+    <button data-mode="focus">Focus</button>
+  </div>
+  <div class="row"><button id="lock">Lock colors</button></div>
+  <p id="status">Starting…</p>
+  <p>Everything runs on your device. No image leaves it.<br>
+     Model: LeJEPA ViT-S/16, a third-party reproduction by OK-AI (Apache-2.0).</p>
+  <video id="video" playsinline muted></video>
+</main>
+
+<script type="module">
+import * as ort from "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.31.1/dist/ort.webgpu.min.mjs";
+ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.31.1/dist/";
+
+const G = 14, D = 384, N = G * G, R = 224, S = 448;
+const qs = new URLSearchParams(location.search);
+const $ = id => document.getElementById(id);
+const view = $("view"), vctx = view.getContext("2d");
+const small = document.createElement("canvas"); small.width = small.height = R;
+const sctx = small.getContext("2d", { willReadFrequently: true });
+const ov = document.createElement("canvas"); ov.width = ov.height = G;
+const octx = ov.getContext("2d"), od = octx.createImageData(G, G);
+
+const state = window.demo = { mode: "colors", backend: "", ms: 0, fps: 0, frames: 0, locked: false };
+let session = null, src = null, busy = false, query = null;
+const setStatus = t => { $("status").textContent = t; };
+
+// ---------- model
+async function fetchBytes(url, label) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`${url}: HTTP ${r.status}`);
+  const total = +r.headers.get("content-length") || 0, reader = r.body.getReader(), chunks = [];
+  let got = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value); got += value.length;
+    setStatus(`Loading ${label}: ${(got / 1e6).toFixed(0)}${total ? " / " + (total / 1e6).toFixed(0) : ""} MB`);
+  }
+  const out = new Uint8Array(got);
+  let o = 0;
+  for (const c of chunks) { out.set(c, o); o += c.length; }
+  return out;
+}
+
+async function createSession() {
+  if (qs.get("ep") !== "wasm" && navigator.gpu) {
+    try {
+      const ad = await navigator.gpu.requestAdapter();
+      if (ad && ad.features.has("shader-f16")) {
+        const bytes = await fetchBytes("model_fp16.onnx", "model");
+        setStatus("Preparing model…");
+        return [await ort.InferenceSession.create(bytes, { executionProviders: ["webgpu"] }), "WebGPU"];
+      }
+    } catch (e) { console.warn("WebGPU unavailable, falling back to WASM", e); }
+  }
+  const bytes = await fetchBytes("model_q8.onnx", "model");
+  setStatus("Preparing model…");
+  return [await ort.InferenceSession.create(bytes, { executionProviders: ["wasm"] }), "WASM"];
+}
+
+// ---------- source
+async function startCamera() {
+  const stream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: "environment", width: { ideal: 640 }, height: { ideal: 640 } }, audio: false });
+  const v = $("video");
+  v.srcObject = stream;
+  await v.play();
+  src = v;
+}
+const useImage = url => new Promise((res, rej) => {
+  const im = new Image();
+  im.onload = () => { src = im; res(); };
+  im.onerror = () => rej(new Error("image failed to load"));
+  im.src = url;
+});
+function drawSquare(ctx, size) {
+  const w = src.videoWidth || src.naturalWidth, h = src.videoHeight || src.naturalHeight, s = Math.min(w, h);
+  ctx.drawImage(src, (w - s) / 2, (h - s) / 2, s, s, 0, 0, size, size);
+}
+
+// ---------- maths
+const dot = (a, b) => { let s = 0; for (let j = 0; j < D; j++) s += a[j] * b[j]; return s; };
+const normalize = a => { const n = Math.sqrt(dot(a, a)) || 1; for (let j = 0; j < D; j++) a[j] /= n; };
+const clamp01 = t => t < 0 ? 0 : t > 1 ? 1 : t;
+const STOPS = [[0, 0, 4], [87, 16, 110], [188, 55, 84], [249, 142, 9], [252, 255, 164]];
+function heat(t, i, alpha) {
+  const x = clamp01(t) * 4, k = Math.min(3, x | 0), f = x - k, a = STOPS[k], b = STOPS[k + 1];
+  od.data[4 * i] = a[0] + (b[0] - a[0]) * f; od.data[4 * i + 1] = a[1] + (b[1] - a[1]) * f;
+  od.data[4 * i + 2] = a[2] + (b[2] - a[2]) * f; od.data[4 * i + 3] = 255 * alpha;
+}
+
+// PCA basis tracked by warm-started power iteration, so colors drift slowly instead of flipping
+const mu = new Float32Array(D), V = [0, 1, 2].map(() => Float32Array.from({ length: D }, () => Math.random() - 0.5));
+const lo = new Float32Array(3), hi = new Float32Array(3);
+const Xc = new Float32Array(N * D), proj = new Float32Array(N), tmp = new Float32Array(D), Y = new Float32Array(N * 3);
+let pcaReady = false;
+function center(feat) {
+  for (let i = 0; i < N; i++) for (let j = 0; j < D; j++) Xc[i * D + j] = feat[i * D + j] - mu[j];
+}
+function updateBasis(feat) {
+  const b = pcaReady ? 0.1 : 1, a = pcaReady ? 0.2 : 1, iters = pcaReady ? 1 : 20;
+  tmp.fill(0);
+  for (let i = 0; i < N; i++) for (let j = 0; j < D; j++) tmp[j] += feat[i * D + j];
+  for (let j = 0; j < D; j++) mu[j] += b * (tmp[j] / N - mu[j]);
+  center(feat);
+  for (let k = 0; k < 3; k++) for (let it = 0; it < iters; it++) {
+    const v = V[k];
+    for (let i = 0; i < N; i++) { let s = 0; for (let j = 0; j < D; j++) s += Xc[i * D + j] * v[j]; proj[i] = s; }
+    tmp.fill(0);
+    for (let i = 0; i < N; i++) { const p = proj[i]; for (let j = 0; j < D; j++) tmp[j] += Xc[i * D + j] * p; }
+    normalize(tmp);
+    for (let j = 0; j < D; j++) v[j] = (1 - a) * v[j] + a * tmp[j];
+    for (let m = 0; m < k; m++) { const d = dot(v, V[m]); for (let j = 0; j < D; j++) v[j] -= d * V[m][j]; }
+    normalize(v);
+  }
+}
+function colors(feat) {
+  const first = !pcaReady;
+  if (!state.locked || first) updateBasis(feat); else center(feat);
+  for (let k = 0; k < 3; k++) {
+    let m = 0, q = 0;
+    for (let i = 0; i < N; i++) {
+      let s = 0;
+      for (let j = 0; j < D; j++) s += Xc[i * D + j] * V[k][j];
+      Y[i * 3 + k] = s; m += s; q += s * s;
+    }
+    m /= N;
+    const sd = Math.sqrt(Math.max(q / N - m * m, 1e-12));
+    if (!state.locked || first) {
+      const b = first ? 1 : 0.1;
+      lo[k] += b * (m - 2 * sd - lo[k]); hi[k] += b * (m + 2 * sd - hi[k]);
+    }
+  }
+  pcaReady = true;
+  for (let i = 0; i < N; i++) {
+    let sat = 0;
+    for (let k = 0; k < 3; k++) {
+      const c = clamp01((Y[i * 3 + k] - lo[k]) / (hi[k] - lo[k]));
+      od.data[4 * i + k] = 255 * c;
+      sat = Math.max(sat, Math.abs(c - 0.5) * 2);
+    }
+    // automatic overlay strength: distinctive patches get more color, ambiguous ones show the camera
+    od.data[4 * i + 3] = 255 * (0.55 + 0.35 * sat);
+  }
+}
+function touch(feat) {
+  if (!query) { od.data.fill(0); return; }
+  for (let i = 0; i < N; i++) {
+    let s = 0, n = 0;
+    for (let j = 0; j < D; j++) { const f = feat[i * D + j]; s += f * query[j]; n += f * f; }
+    // spotlight: similar patches stay lit, the rest is dimmed
+    const t = clamp01((s / Math.sqrt(n) - 0.35) / 0.5);
+    od.data[4 * i] = od.data[4 * i + 1] = od.data[4 * i + 2] = 0;
+    od.data[4 * i + 3] = 230 * (1 - t);
+  }
+}
+function focus(attn) {
+  let mx = 0;
+  for (let i = 0; i < N; i++) mx = Math.max(mx, attn[i]);
+  for (let i = 0; i < N; i++) { const t = attn[i] / mx; heat(t, i, Math.sqrt(t)); }
+}
+
+// ---------- frame
+const input = new Float32Array(3 * R * R);
+async function step() {
+  drawSquare(sctx, R);
+  const px = sctx.getImageData(0, 0, R, R).data, n = R * R;
+  for (let i = 0; i < n; i++) { input[i] = px[4 * i] / 255; input[n + i] = px[4 * i + 1] / 255; input[2 * n + i] = px[4 * i + 2] / 255; }
+  const t0 = performance.now();
+  const out = await session.run({ image: new ort.Tensor("float32", input, [1, 3, R, R]) });
+  const ms = performance.now() - t0, feat = out.feat.data;
+  state.ms = state.frames ? 0.8 * state.ms + 0.2 * ms : ms;
+  state.frames++;
+  state.feat = feat;
+
+  drawSquare(vctx, S);
+  if (state.mode === "colors") colors(feat);
+  else if (state.mode === "touch") touch(feat);
+  else focus(out.attn.data);
+  octx.putImageData(od, 0, 0);
+  vctx.imageSmoothingEnabled = true;
+  vctx.drawImage(ov, 0, 0, S, S);
+  setStatus(`${state.backend} · ${state.ms.toFixed(0)} ms/frame · ${state.fps.toFixed(1)} fps`);
+}
+let lastT = 0;
+async function loop(t) {
+  if (session && src && !busy) {
+    busy = true;
+    try {
+      await step();
+      if (lastT) state.fps = 0.8 * state.fps + 0.2 * 1000 / (t - lastT);
+      lastT = t;
+    } catch (e) { setStatus("Error: " + e.message); session = null; console.error(e); }
+    busy = false;
+  }
+  requestAnimationFrame(loop);
+}
+
+// ---------- UI
+function setMode(m) {
+  state.mode = m;
+  for (const b of $("modes").children) b.classList.toggle("on", b.dataset.mode === m);
+  $("lock").parentElement.style.display = m === "colors" ? "" : "none";
+}
+$("modes").addEventListener("click", e => { if (e.target.dataset.mode) setMode(e.target.dataset.mode); });
+$("lock").addEventListener("click", () => {
+  state.locked = !state.locked;
+  $("lock").classList.toggle("on", state.locked);
+});
+view.addEventListener("pointerdown", e => {
+  if (state.mode !== "touch" || !state.feat) return;
+  const r = view.getBoundingClientRect();
+  const gx = Math.min(G - 1, Math.floor((e.clientX - r.left) / r.width * G));
+  const gy = Math.min(G - 1, Math.floor((e.clientY - r.top) / r.height * G));
+  query = Float32Array.from(state.feat.subarray((gy * G + gx) * D, (gy * G + gx + 1) * D));
+  normalize(query);
+});
+
+requestAnimationFrame(loop);
+try {
+  // camera starts on load; ?img=test.jpg swaps in a still image for self-testing
+  await (qs.get("img") ? useImage(qs.get("img")) : startCamera());
+  [session, state.backend] = await createSession();
+} catch (e) { setStatus("Could not start: " + e.message); console.error(e); }
+</script>
+</body>
+</html>
