@@ -24,172 +24,111 @@
   "hi": 1
  },
  {
-  "name": "LayerNormalization",
+  "name": "matmul 2-D, 101x64 . 64x101",
   "file": "t02.onnx",
   "shape": [
-   1,
    101,
-   384
+   128
   ],
-  "lo": -6,
-  "hi": 6
+  "lo": -1.5,
+  "hi": 1.5
  },
  {
-  "name": "layer norm, primitive",
+  "name": "matmul 2-D, 104x64 . 64x104",
   "file": "t03.onnx",
   "shape": [
-   1,
-   101,
-   384
+   104,
+   128
   ],
-  "lo": -6,
-  "hi": 6
+  "lo": -1.5,
+  "hi": 1.5
  },
  {
-  "name": "Softmax",
+  "name": "q k^T 3-D, 101 tokens",
   "file": "t04.onnx",
   "shape": [
    1,
-   6,
    101,
-   101
+   1152
   ],
-  "lo": -8,
-  "hi": 8
+  "lo": -1.5,
+  "hi": 1.5
  },
  {
-  "name": "softmax, primitive",
+  "name": "q k^T 3-D, 104 tokens",
   "file": "t05.onnx",
   "shape": [
    1,
-   6,
-   101,
-   101
+   104,
+   1152
   ],
-  "lo": -8,
-  "hi": 8
+  "lo": -1.5,
+  "hi": 1.5
  },
  {
-  "name": "GELU (Erf)",
+  "name": "q k^T 4-D, 101 tokens",
   "file": "t06.onnx",
   "shape": [
    1,
    101,
-   1536
+   1152
   ],
-  "lo": -4,
-  "hi": 4
+  "lo": -1.5,
+  "hi": 1.5
  },
  {
-  "name": "gelu, tanh form",
+  "name": "q k^T 4-D, 104 tokens",
   "file": "t07.onnx",
   "shape": [
    1,
-   101,
-   1536
+   104,
+   1152
   ],
-  "lo": -4,
-  "hi": 4
+  "lo": -1.5,
+  "hi": 1.5
  },
  {
-  "name": "linear (MatMul + Add)",
+  "name": "attention, matmul, 101",
   "file": "t08.onnx",
   "shape": [
    1,
    101,
-   384
+   1152
   ],
-  "lo": -3,
-  "hi": 3
+  "lo": -1.5,
+  "hi": 1.5
  },
  {
-  "name": "linear, f16 weights + Cast",
+  "name": "attention, matmul, 104",
   "file": "t09.onnx",
   "shape": [
    1,
-   101,
-   384
+   104,
+   1152
   ],
-  "lo": -3,
-  "hi": 3
+  "lo": -1.5,
+  "hi": 1.5
  },
  {
-  "name": "q k^T, rank-5 split",
+  "name": "attention, einsum, 104",
   "file": "t10.onnx",
   "shape": [
    1,
-   101,
-   384
+   104,
+   1152
   ],
-  "lo": -3,
-  "hi": 3
+  "lo": -1.5,
+  "hi": 1.5
  },
  {
-  "name": "q k^T, rank-4 split",
+  "name": "attention, mul+sum, 104",
   "file": "t11.onnx",
   "shape": [
    1,
-   101,
-   384
+   104,
+   1152
   ],
-  "lo": -3,
-  "hi": 3
- },
- {
-  "name": "merge heads",
-  "file": "t12.onnx",
-  "shape": [
-   1,
-   6,
-   101,
-   64
-  ],
-  "lo": -2,
-  "hi": 2
- },
- {
-  "name": "cls token + position",
-  "file": "t13.onnx",
-  "shape": [
-   1,
-   100,
-   384
-  ],
-  "lo": -3,
-  "hi": 3
- },
- {
-  "name": "attention readout",
-  "file": "t14.onnx",
-  "shape": [
-   1,
-   6,
-   101,
-   101
-  ],
-  "lo": 0,
-  "hi": 1
- },
- {
-  "name": "block, standard ops",
-  "file": "t15.onnx",
-  "shape": [
-   1,
-   101,
-   384
-  ],
-  "lo": -3,
-  "hi": 3
- },
- {
-  "name": "block, primitive ops",
-  "file": "t16.onnx",
-  "shape": [
-   1,
-   101,
-   384
-  ],
-  "lo": -3,
-  "hi": 3
+  "lo": -1.5,
+  "hi": 1.5
  }
 ]

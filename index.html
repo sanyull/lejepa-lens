@@ -58,12 +58,14 @@ const $ = id => document.getElementById(id);
 const view = $("view"), vctx = view.getContext("2d");
 const small = document.createElement("canvas"), sctx = small.getContext("2d", { willReadFrequently: true });
 const ov = document.createElement("canvas"), octx = ov.getContext("2d");
+const prev = document.createElement("canvas"), pctx = prev.getContext("2d");   // the map before the current one
+const mix = document.createElement("canvas"), mctx = mix.getContext("2d");     // cross-fade of the two
 const PS = 16, D = 384;
 const CHECKS = { 224: [0, 27, 52, 77, 97, 122, 150, 195], 160: [0, 13, 27, 38, 52, 64, 77, 99], 128: [0, 9, 18, 27, 36, 45, 54, 63] };
 const SIZE_MB = { gpu: 43, q8: 23 };
 
 const state = window.demo = { mode: "colors", backend: "", ms: 0, fps: 0, frames: 0, locked: false, check: null, res: 0, note: "", threads: 0 };
-let run = null, src = null, query = null, hasMap = false;
+let run = null, src = null, query = null, hasMap = false, hasPrev = false, fadeT0 = 0, fadeMs = 0;
 const setStatus = t => { $("status").textContent = t; };
 const saved = k => { try { return localStorage.getItem(k); } catch (e) { return null; } };
 const save = (k, v) => { try { localStorage.setItem(k, v); } catch (e) { /* storage unavailable */ } };
@@ -83,7 +85,7 @@ function layout() {
 wideQ.addEventListener("change", layout);
 function setup(res) {
   R = state.res = res; G = R / PS; N = G * G; CHECK = CHECKS[R];
-  small.width = small.height = ov.width = ov.height = R;
+  small.width = small.height = ov.width = ov.height = prev.width = prev.height = mix.width = mix.height = R;
   od = octx.createImageData(R, R);
   input = new Float32Array(3 * R * R);
   pm = new Float32Array(N * 3); Xc = new Float32Array(N * D); proj = new Float32Array(N);
@@ -93,13 +95,13 @@ function setup(res) {
     const y = (i / G) | 0, x = i % G, ey = y === 0 || y === G - 1, ex = x === 0 || x === G - 1;
     return ey && ex ? 0.25 : ey || ex ? 0.5 : 1;
   });
-  pcaReady = focusReady = hasMap = false;
+  pcaReady = focusReady = hasMap = hasPrev = false;
   query = null;
   layout();
 }
 const mobile = navigator.userAgentData ? navigator.userAgentData.mobile : /Android|iPhone|iPad/.test(navigator.userAgent);
 const forced = +qs.get("res") in CHECKS ? +qs.get("res") : 0;      // ?res=224|160|128
-const RES_GPU = forced || (mobile ? 160 : 224), RES_CPU = forced || (mobile ? 128 : 224);
+const RES_GPU = forced === 224 || forced === 160 ? forced : mobile ? 160 : 224, RES_CPU = forced || (mobile ? 128 : 224);
 setup(RES_GPU);
 
 // ---------- model
@@ -142,9 +144,35 @@ async function fidelity(fn) {
 }
 
 // An engine is an async function: Float32Array image -> { feat, attn }.
+let ortGpu = null;
+async function loadOrtGpu() {
+  if (!ortGpu) { ortGpu = await import(ORT + "ort.webgpu.min.mjs"); ortGpu.env.wasm.wasmPaths = ORT; }
+  return ortGpu;
+}
+// GPUs differ in which operations they get right (an Adreno got the attention matrix product wrong).
+// A probe is the attention core without weights, a few kB: it runs on the CPU and on the GPU with the
+// same input, and the full model is only downloaded in a form whose probe the GPU computes correctly.
+const KINDS = ["matmul", "einsum", "mulsum"];
+async function probe(kind) {
+  const ort = await loadOrtGpu(), r = await fetch(`probe_${kind}_${R}.onnx`);
+  if (!r.ok) return false;
+  const bytes = new Uint8Array(await r.arrayBuffer());
+  const n = N + 1 + (4 - (N + 1) % 4) % 4, x = new Float32Array(n * 1152);
+  let seed = 12345;
+  for (let k = 0; k < x.length; k++) { seed = (seed * 1664525 + 1013904223) >>> 0; x[k] = 3 * seed / 4294967296 - 1.5; }
+  const once = async ep => {
+    const s = await ort.InferenceSession.create(bytes.slice(), { executionProviders: [ep] });
+    const y = Float32Array.from((await s.run({ x: new ort.Tensor("float32", x, [1, n, 1152]) })).y.data);
+    await s.release();
+    return y;
+  };
+  const a = await once("wasm"), b = await once("webgpu");
+  let num = 0, den = 0;
+  for (let k = 0; k < a.length; k++) { num += (a[k] - b[k]) ** 2; den += a[k] ** 2; }
+  return Math.sqrt(num / den) < 1e-3;
+}
 async function gpuEngine(bytes) {
-  const ort = await import(ORT + "ort.webgpu.min.mjs");
-  ort.env.wasm.wasmPaths = ORT;
+  const ort = await loadOrtGpu();
   const s = await ort.InferenceSession.create(bytes, { executionProviders: ["webgpu"] });
   const fn = async x => {
     const o = await s.run({ image: new ort.Tensor("float32", x, [1, 3, R, R]) });
@@ -195,7 +223,7 @@ async function tunedWasmEngine(bytes) {
   return best.fn;
 }
 // A device whose GPU failed the check is remembered, so later visits skip that download (?ep=webgpu retries).
-const GPU_KEY = "lens.gpu.v3";
+const GPU_KEY = "lens.gpu.v4";
 
 async function createEngine() {
   const want = qs.get("ep");
@@ -203,19 +231,28 @@ async function createEngine() {
   else if (want === "wasm") state.note = "gpu skipped";
   else if (want !== "webgpu" && saved(GPU_KEY)) state.note = `gpu skipped, earlier: ${saved(GPU_KEY)}`;
   else {
-    // this model uses only basic operations and 32-bit arithmetic: phone GPUs got other versions wrong
-    const bytes = await fetchBytes(`model_gpu_${R}.onnx`, SIZE_MB.gpu);
-    setStatus("Preparing model…");
-    let fn = null;
+    let fn = null, verdict = true;                 // verdict: the failure is a property of this GPU
     try {
+      setStatus("Checking the GPU…");
+      let kind = null;
+      for (const k of qs.get("kind") ? [qs.get("kind")] : KINDS) {
+        if (k !== "matmul" && R !== 160) setup(160);          // the alternative forms exist at 160 px only
+        if (await probe(k)) { kind = k; break; }
+      }
+      if (!kind) throw new Error("no attention form is computed correctly");
+      // the GPU models use only basic operations and 32-bit arithmetic
+      verdict = false;
+      const bytes = await fetchBytes(`model_gpu_${kind}_${R}.onnx`, SIZE_MB.gpu);
+      verdict = true;
+      setStatus("Preparing model…");
       fn = await gpuEngine(bytes);
       state.check = await fidelity(fn);
-      if (state.check === null || state.check >= 0.95) { state.note = `gpu check ${state.check === null ? "n/a" : state.check.toFixed(3)}`; return [fn, "WebGPU"]; }
-      state.note = `gpu check ${state.check.toFixed(3)}`;
+      state.note = `gpu ${kind} check ${state.check === null ? "n/a" : state.check.toFixed(3)}`;
+      if (state.check === null || state.check >= 0.95) return [fn, "WebGPU"];
     } catch (e) { state.note = `gpu error: ${e.message}`; }
     console.warn("WebGPU not usable, falling back to WASM:", state.note);
     if (fn) fn.release();
-    save(GPU_KEY, state.note);
+    if (verdict) save(GPU_KEY, state.note);
   }
   setup(RES_CPU);
   const bytes = await fetchBytes(`model_q8_${R}.onnx`, SIZE_MB.q8);
@@ -370,8 +407,16 @@ function draw() {
   if (src) {
     drawSource(vctx, y0 / R, bandH / R, view.width, view.height);
     if (hasMap) {
+      // cross-fade from the previous map over about one inference interval, so updates do not pop
+      const a = hasPrev && fadeMs ? Math.min(1, (performance.now() - fadeT0) / fadeMs) : 1;
+      let top = ov;
+      if (a < 1) {
+        mctx.globalCompositeOperation = "copy"; mctx.globalAlpha = 1 - a; mctx.drawImage(prev, 0, 0);
+        mctx.globalCompositeOperation = "lighter"; mctx.globalAlpha = a; mctx.drawImage(ov, 0, 0);
+        top = mix;
+      }
       vctx.imageSmoothingEnabled = true;
-      vctx.drawImage(ov, 0, y0, R, bandH, 0, 0, view.width, view.height);
+      vctx.drawImage(top, 0, y0, R, bandH, 0, 0, view.width, view.height);
     }
   }
   requestAnimationFrame(draw);
@@ -386,7 +431,8 @@ async function inferLoop() {
     const { feat, attn } = await run(input);
     const t1 = performance.now();
     state.ms = state.frames ? 0.8 * state.ms + 0.2 * (t1 - t0) : t1 - t0;
-    if (last) state.fps = state.fps ? 0.8 * state.fps + 0.2 * 1000 / (t1 - last) : 1000 / (t1 - last);
+    const gap = last ? t1 - last : 0;
+    if (gap) state.fps = state.fps ? 0.8 * state.fps + 0.2 * 1000 / gap : 1000 / gap;
     last = t1;
     state.frames++;
     state.feat = feat;
@@ -395,7 +441,9 @@ async function inferLoop() {
     if (state.mode === "colors") colors(feat, px);
     else if (state.mode === "touch") touch(feat, px);
     else focus(attn, px);
+    if (hasMap) { pctx.globalCompositeOperation = "copy"; pctx.drawImage(ov, 0, 0); hasPrev = true; }
     octx.putImageData(od, 0, 0);
+    fadeT0 = performance.now(); fadeMs = Math.min(500, gap);
     hasMap = true;
     const dbg = qs.get("debug") ? ` · ${R}px · ${state.note} · threads ${state.threads}` : "";
     setStatus(`${state.backend} · ${state.ms.toFixed(0)} ms/frame · ${state.fps.toFixed(1)} fps${dbg}`);
@@ -409,7 +457,7 @@ function setMode(m) {
   for (const b of $("modes").children) b.classList.toggle("on", b.dataset.mode === m);
   $("lock").parentElement.style.display = m === "colors" ? "" : "none";
   focusReady = false;
-  hasMap = false;          // hide the previous mode's map until the next result
+  hasMap = hasPrev = false;   // hide the previous mode's map until the next result
 }
 $("modes").addEventListener("click", e => { if (e.target.dataset.mode) setMode(e.target.dataset.mode); });
 $("lock").addEventListener("click", () => {
