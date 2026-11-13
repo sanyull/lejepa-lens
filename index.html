@@ -62,6 +62,7 @@ const ov = document.createElement("canvas"), octx = ov.getContext("2d");
 const prev = document.createElement("canvas"), pctx = prev.getContext("2d");   // the map before the current one
 const mix = document.createElement("canvas"), mctx = mix.getContext("2d");     // cross-fade of the two
 const PS = 16, D = 384;
+const TH = 48, MAXS = 16;       // motion tracking: thumbnail side, and the largest shift followed (in thumbnail pixels)
 const CHECKS = { 224: [0, 27, 52, 77, 97, 122, 150, 195], 160: [0, 13, 27, 38, 52, 64, 77, 99], 128: [0, 9, 18, 27, 36, 45, 54, 63] };
 const SIZE_MB = { gpu: 43, q8: 23 };
 
@@ -74,7 +75,10 @@ const save = (k, v) => { try { localStorage.setItem(k, v); } catch (e) { /* stor
 // ---------- input size
 // R is the model's square input in pixels, G the patches per side, N the patch count. Everything sized
 // by them is (re)allocated here: the GPU and CPU paths may use different sizes.
-let R, G, N, CHECK, od, input, pm, Xc, proj, Y, T, A, TAPER, y0, bandH, pcaReady, focusReady;
+// The map canvases are larger than the map by a margin PADM on every side (PW across), filled by
+// repeating the map's border pixels, so a map drawn displaced still covers the whole picture.
+let R, G, N, CHECK, PADM, PW, od, od32, input, pm, Xc, proj, Y, T, A, TAPER, y0, bandH, pcaReady, focusReady;
+let lastFrame = -1, lastMap = -1, mapVer = 0;      // what the screen currently shows
 const wideQ = matchMedia("(orientation: landscape) and (max-height: 500px)");
 function layout() {
   // the model always sees a centred square; a phone held sideways shows the middle band of it (16:9)
@@ -82,12 +86,16 @@ function layout() {
   y0 = (R - bandH) / 2;
   view.width = wideQ.matches ? 640 : 448;
   view.height = wideQ.matches ? 360 : 448;
+  lastFrame = -1;
 }
 wideQ.addEventListener("change", layout);
 function setup(res) {
   R = state.res = res; G = R / PS; N = G * G; CHECK = CHECKS[R];
-  small.width = small.height = ov.width = ov.height = prev.width = prev.height = mix.width = mix.height = R;
-  od = octx.createImageData(R, R);
+  PADM = Math.ceil(MAXS * R / TH) + 1; PW = R + 2 * PADM;
+  small.width = small.height = R;
+  ov.width = ov.height = prev.width = prev.height = mix.width = mix.height = PW;
+  od = octx.createImageData(PW, PW);
+  od32 = new Uint32Array(od.data.buffer);
   input = new Float32Array(3 * R * R);
   pm = new Float32Array(N * 3); Xc = new Float32Array(N * D); proj = new Float32Array(N);
   Y = new Float32Array(N * 3); T = new Float32Array(N); A = new Float32Array(N);
@@ -287,18 +295,15 @@ function drawSource(ctx, sy, sh, dw, dh) {
 // A map describes the frame the model started from, about one inference ago. To keep it on the objects
 // while the camera moves, the page measures how far the live picture has shifted since that frame
 // (on 48x48 thumbnails) and draws the map displaced by the same amount.
-const TH = 48, MAXS = 16;
 const thumb = document.createElement("canvas"); thumb.width = thumb.height = TH;
 const tctx = thumb.getContext("2d", { willReadFrequently: true });
 tctx.imageSmoothingQuality = "medium";
 const refT = new Float32Array(TH * TH), capT = new Float32Array(TH * TH);
 let shift = [0, 0], curShift0 = [0, 0], prevShift0 = [0, 0];   // in thumbnail pixels
-// Shrinking happens on a GPU canvas first, so reading the thumbnail back copies 160x160 pixels, not the frame.
-const mid = document.createElement("canvas"); mid.width = mid.height = 160;
-const midctx = mid.getContext("2d");
-function grabThumb(out, canvas) {               // zero-mean brightness of a square frame
-  midctx.drawImage(canvas, 0, 0, canvas.width, canvas.height, 0, 0, 160, 160);
-  tctx.drawImage(mid, 0, 0, 160, 160, 0, 0, TH, TH);
+// The thumbnail is drawn straight from the camera into a CPU canvas: reading pixels back from a GPU
+// canvas would make the page wait for the GPU, which is busy running the model.
+function grabThumb(out) {                       // zero-mean brightness of the current picture
+  drawSource(tctx, 0, 1, TH, TH);
   const d = tctx.getImageData(0, 0, TH, TH).data;
   let m = 0;
   for (let i = 0; i < TH * TH; i++) { out[i] = 0.299 * d[4 * i] + 0.587 * d[4 * i + 1] + 0.114 * d[4 * i + 2]; m += out[i]; }
@@ -345,7 +350,7 @@ function pushFrame(now) {
   head = (head + 1) % RING;
   const f = ring[head];
   drawSource(f.ctx, 0, 1, RS, RS);
-  grabThumb(f.th, f.c);
+  grabThumb(f.th);
   f.t = now;
   return f;
 }
@@ -364,23 +369,17 @@ function storePerVideoFrame(v) {
   v.requestVideoFrameCallback(onFrame);
 }
 
-// A map drawn displaced leaves a strip of the picture uncovered. The map is therefore extended past
-// its borders by repeating its edge rows and columns.
-const padc = document.createElement("canvas"), xctx = padc.getContext("2d");
-function padMap(c, M) {                         // region (0, y0, R, bandH) of c -> padc, with a margin M
-  const h = Math.round(bandH), y = Math.round(y0);
-  if (padc.width !== R + 2 * M || padc.height !== h + 2 * M) { padc.width = R + 2 * M; padc.height = h + 2 * M; }
-  xctx.globalCompositeOperation = "copy";
-  xctx.drawImage(c, 0, y, R, h, M, M, R, h);
-  xctx.globalCompositeOperation = "source-over";
-  xctx.drawImage(c, 0, y, R, 1, M, 0, R, M);                       // top
-  xctx.drawImage(c, 0, y + h - 1, R, 1, M, M + h, R, M);           // bottom
-  xctx.drawImage(c, 0, y, 1, h, 0, M, M, h);                       // left
-  xctx.drawImage(c, R - 1, y, 1, h, M + R, M, M, h);               // right
-  xctx.drawImage(c, 0, y, 1, 1, 0, 0, M, M);                       // corners
-  xctx.drawImage(c, R - 1, y, 1, 1, M + R, 0, M, M);
-  xctx.drawImage(c, 0, y + h - 1, 1, 1, 0, M + h, M, M);
-  xctx.drawImage(c, R - 1, y + h - 1, 1, 1, M + R, M + h, M, M);
+// A map drawn displaced would leave a strip of the picture uncovered, so the map's border pixels are
+// repeated into the margin around it. This is done on the pixel data, before the map reaches a canvas.
+function padEdges() {
+  const M = PADM, ya = Math.floor(y0) + M, yb = Math.ceil(y0 + bandH) + M;
+  for (let y = ya; y < yb; y++) {
+    const row = y * PW;
+    od32.fill(od32[row + M], row, row + M);
+    od32.fill(od32[row + M + R - 1], row + M + R, row + PW);
+  }
+  for (let y = ya - M; y < ya; y++) od32.copyWithin(y * PW, ya * PW, ya * PW + PW);
+  for (let y = yb; y < yb + M; y++) od32.copyWithin(y * PW, (yb - 1) * PW, yb * PW);
 }
 
 // ---------- maths
@@ -430,7 +429,7 @@ function upsample(vals, C, px, write, wr = WR) {
           if (C === 3) { s1 += w * vals[q * C + 1]; s2 += w * vals[q * C + 2]; }
         }
       }
-      write(o, s0 / den, s1 / den, s2 / den);
+      write(((y + PADM) * PW + x + PADM) * 4, s0 / den, s1 / den, s2 / den);   // position inside the padded map
     }
   }
 }
@@ -511,32 +510,39 @@ function focus(attn, px) {
 // ---------- frames
 // Every animation frame stores the camera picture, then shows the one from `delay` ago with the map
 // the model last produced on top.
+let gain = 1, settled = true;                   // overlay strength, and whether it has stopped changing
 function draw(now) {
-  if (src) {
-    if (!perVideoFrame && now - ring[head].t > 12) pushFrame(now);   // at most about 60 stored frames a second
-    const f = delay ? frameAt(now - delay) : ring[head];
-    vctx.drawImage(f.c, 0, RS * y0 / R, RS, RS * bandH / R, 0, 0, view.width, view.height);
-    if (hasMap) {
-      // follow the camera: how far is this frame from the one the map was computed from?
-      shift = fresh ? estimateShift(refT, f.th, 0, 0, 6) : estimateShift(refT, f.th, shift[0], shift[1]);
-      if (fresh) { curShift0 = shift; fresh = false; }
-      state.shift = shift;
-      const k = R / TH;
-      // cross-fade from the previous map over about one inference interval, so updates do not pop
-      const a = hasPrev && fadeMs ? Math.min(1, (performance.now() - fadeT0) / fadeMs) : 1;
-      let top = ov;
-      if (a < 1) {
-        mctx.globalCompositeOperation = "copy"; mctx.globalAlpha = 1 - a;
-        mctx.drawImage(prev, (prevShift0[0] - curShift0[0]) * k, (prevShift0[1] - curShift0[1]) * k);
-        mctx.globalCompositeOperation = "lighter"; mctx.globalAlpha = a; mctx.drawImage(ov, 0, 0);
-        top = mix;
-      }
-      const M = Math.ceil(MAXS * k) + 1;
-      padMap(top, M);
-      vctx.imageSmoothingEnabled = true;
-      vctx.drawImage(padc, M - shift[0] * k, M - shift[1] * k, R, Math.round(bandH), 0, 0, view.width, view.height);
-    }
+  if (!src) return;
+  if (!perVideoFrame && now - ring[head].t > 12) pushFrame(now);   // at most about 60 stored frames a second
+  const f = delay ? frameAt(now - delay) : ring[head];
+  const a = hasMap && hasPrev && fadeMs ? Math.min(1, (performance.now() - fadeT0) / fadeMs) : 1;
+  // nothing new to show: same camera picture, same map, no fade in progress
+  if (f.t === lastFrame && mapVer === lastMap && a >= 1 && settled) return;
+  lastFrame = f.t; lastMap = mapVer;
+  vctx.drawImage(f.c, 0, RS * y0 / R, RS, RS * bandH / R, 0, 0, view.width, view.height);
+  if (!hasMap) return;
+  // follow the camera: how far is this frame from the one the map was computed from?
+  shift = fresh ? estimateShift(refT, f.th, 0, 0, 6) : estimateShift(refT, f.th, shift[0], shift[1]);
+  if (fresh) { curShift0 = shift; fresh = false; }
+  state.shift = shift;
+  const k = R / TH;
+  // cross-fade from the previous map over about one inference interval, so updates do not pop
+  let top = ov;
+  if (a < 1) {
+    mctx.globalCompositeOperation = "copy"; mctx.globalAlpha = 1 - a;
+    mctx.drawImage(prev, (prevShift0[0] - curShift0[0]) * k, (prevShift0[1] - curShift0[1]) * k);
+    mctx.globalCompositeOperation = "lighter"; mctx.globalAlpha = a; mctx.drawImage(ov, 0, 0);
+    top = mix;
   }
+  // a map far from its frame is stale: it fades instead of sliding across the picture
+  const target = clamp01(1 - (Math.hypot(shift[0], shift[1]) - 6) / 8);
+  gain += 0.35 * (target - gain);
+  settled = Math.abs(target - gain) < 0.01;
+  if (settled) gain = target;
+  vctx.imageSmoothingEnabled = true;
+  vctx.globalAlpha = gain;
+  vctx.drawImage(top, PADM - shift[0] * k, PADM + y0 - shift[1] * k, R, bandH, 0, 0, view.width, view.height);
+  vctx.globalAlpha = 1;
 }
 function frameLoop(now) { draw(now); requestAnimationFrame(frameLoop); }
 state.draw = draw;                              // exposed for tests
@@ -547,12 +553,9 @@ const tick = () => document.hidden
 async function inferLoop() {
   let last = 0;
   for (;;) {
-    // the newest stored frame is the model's input (store one now if the preview is not running)
-    let f = ring[head];
-    if (f.t < 0 || performance.now() - f.t > 100) f = pushFrame(performance.now());
-    const tc = f.t;
-    capT.set(f.th);                             // kept as the next map's reference
-    sctx.drawImage(f.c, 0, 0, RS, RS, 0, 0, R, R);
+    drawSource(sctx, 0, 1, R, R);               // the model's input, straight from the camera
+    grabThumb(capT);                            // the same picture, kept as the next map's reference
+    const tc = performance.now();
     const px = sctx.getImageData(0, 0, R, R).data, n = R * R;
     for (let i = 0; i < n; i++) { input[i] = px[4 * i] / 255; input[n + i] = px[4 * i + 1] / 255; input[2 * n + i] = px[4 * i + 2] / 255; }
     const t0 = performance.now();
@@ -569,10 +572,12 @@ async function inferLoop() {
     if (state.mode === "colors") colors(feat, px);
     else if (state.mode === "touch") touch(feat, px);
     else focus(attn, px);
+    padEdges();
     if (hasMap) { pctx.globalCompositeOperation = "copy"; pctx.drawImage(ov, 0, 0); hasPrev = true; }
     prevShift0 = shift;
     refT.set(capT);
     octx.putImageData(od, 0, 0);
+    mapVer++;
     // the preview runs this far behind, so the map appears on the very frame it was computed from
     const t2 = performance.now();
     delay = Math.min(300, delay ? 0.8 * delay + 0.2 * (t2 - tc) : t2 - tc);
@@ -592,6 +597,7 @@ function setMode(m) {
   $("lock").parentElement.style.display = m === "colors" ? "" : "none";
   focusReady = false;
   hasMap = hasPrev = false;   // hide the previous mode's map until the next result
+  mapVer++;
 }
 $("modes").addEventListener("click", e => { if (e.target.dataset.mode) setMode(e.target.dataset.mode); });
 $("lock").addEventListener("click", () => {
